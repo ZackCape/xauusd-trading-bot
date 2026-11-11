@@ -6,6 +6,7 @@ requests>=2.31.0
 feedparser>=6.0.10
 schedule>=1.2.0
 python-dotenv>=1.0.0
+six>=1.16.0
 
 # Keep-Alive Web Server (24/7 Hosting on Replit, Render, Railway)
 flask>=3.0.0

@@ -58,7 +58,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.lines as mlines
 import matplotlib.pyplot as plt
-import mplfinance as mpf
+
+try:
+    import mplfinance as mpf
+    HAS_MPLFINANCE = True
+except ImportError:
+    HAS_MPLFINANCE = False
+    mpf = None
 
 # Load environment variables from .env file if present
 try:
@@ -1196,31 +1202,48 @@ def generate_candlestick_chart(
     vwap = pv.groupby(df_chart.index.date).cumsum() / vol.groupby(df_chart.index.date).cumsum()
     vwap = vwap.bfill().fillna(ema20)
 
-    ap = [
-        mpf.make_addplot(ema20, color="cyan", width=1.5, panel=0),
-        mpf.make_addplot(ema50, color="#9B59B6", width=1.5, panel=0),
-        mpf.make_addplot(vwap, color="#F1C40F", width=1.5, linestyle="dashed", panel=0),
-    ]
+    if mpf is not None:
+        ap = [
+            mpf.make_addplot(ema20, color="cyan", width=1.5, panel=0),
+            mpf.make_addplot(ema50, color="#9B59B6", width=1.5, panel=0),
+            mpf.make_addplot(vwap, color="#F1C40F", width=1.5, linestyle="dashed", panel=0),
+        ]
 
-    fig, axlist = mpf.plot(
-        df_chart,
-        type="candle",
-        style="nightclouds",
-        addplot=ap,
-        hlines=dict(
-            hlines=[pdh, pdl, asian_high, asian_low],
-            colors=["#E74C3C", "#2ECC71", "#E67E22", "#1ABC9C"],
-            linestyle=["-", "-", "--", "--"],
-            linewidths=[1.5, 1.5, 1.2, 1.2],
-        ),
-        volume=True,
-        returnfig=True,
-        figsize=(10, 6),
-        title=f"XAU/USD Gold ({timeframe_label.upper()}) - Quantitative Institutional Levels",
-    )
+        fig, axlist = mpf.plot(
+            df_chart,
+            type="candle",
+            style="nightclouds",
+            addplot=ap,
+            hlines=dict(
+                hlines=[pdh, pdl, asian_high, asian_low],
+                colors=["#E74C3C", "#2ECC71", "#E67E22", "#1ABC9C"],
+                linestyle=["-", "-", "--", "--"],
+                linewidths=[1.5, 1.5, 1.2, 1.2],
+            ),
+            volume=True,
+            returnfig=True,
+            figsize=(10, 6),
+            title=f"XAU/USD Gold ({timeframe_label.upper()}) - Quantitative Institutional Levels",
+        )
 
-    # Custom clear legend on primary candlestick panel
-    axlist[0].legend(
+        ax = axlist[0]
+    else:
+        # Graceful pure matplotlib fallback
+        fig, ax = plt.subplots(figsize=(10, 6), facecolor="#181a1f")
+        ax.set_facecolor("#181a1f")
+        ax.plot(range(len(close)), close, color="white", lw=1.5, label="Close")
+        ax.plot(range(len(ema20)), ema20, color="cyan", lw=1.5)
+        ax.plot(range(len(ema50)), ema50, color="#9B59B6", lw=1.5)
+        ax.plot(range(len(vwap)), vwap, color="#F1C40F", ls="--", lw=1.5)
+        ax.axhline(pdh, color="#E74C3C", lw=1.5)
+        ax.axhline(pdl, color="#2ECC71", lw=1.5)
+        ax.axhline(asian_high, color="#E67E22", ls="--", lw=1.2)
+        ax.axhline(asian_low, color="#1ABC9C", ls="--", lw=1.2)
+        ax.set_title(f"XAU/USD Gold ({timeframe_label.upper()}) - Quantitative Institutional Levels", color="white")
+        ax.tick_params(colors="white")
+
+    # Custom clear legend on primary panel
+    ax.legend(
         [
             mlines.Line2D([0], [0], color="cyan", lw=1.5),
             mlines.Line2D([0], [0], color="#9B59B6", lw=1.5),
@@ -3064,11 +3087,11 @@ def main():
         logger.info("Diagnostic scan complete. Exiting cleanly.")
         sys.exit(0)
 
+    # Immediately initialize the Keep-Alive Web Server so Render/cloud platforms bind to PORT without delay!
+    start_keep_alive()
+
     # 2. Interactive Discord Bot Mode (if DISCORD_BOT_TOKEN is set)
     if DISCORD_BOT_TOKEN and HAS_DISCORD:
-        # Start lightweight Keep-Alive Flask web server for 24/7 cloud hosting (Render/Replit/UptimeRobot)
-        start_keep_alive()
-
         logger.info("Starting interactive Discord Bot with Slash Commands (/predict, /levels, /news, /chart, /calc, /strategies)...")
         try:
             bot.run(DISCORD_BOT_TOKEN)
@@ -3077,7 +3100,6 @@ def main():
             sys.exit(1)
     else:
         # 3. Webhook / Standalone Scheduler Mode
-        start_keep_alive()
         logger.info("=" * 70)
         logger.info("[MODE] No DISCORD_BOT_TOKEN detected in .env.")
         logger.info("Running in Standalone Webhook / Telegram / Terminal loop mode.")
