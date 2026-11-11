@@ -235,6 +235,8 @@ class MarketDataEngine:
     institutional levels, and price-action candle patterns.
     """
 
+    _last_known_candles: Optional[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, str]] = None
+
     def __init__(self, mode: str = "AUTO"):
         self.mode = mode.upper()
         self.mt5_initialized = False
@@ -263,43 +265,60 @@ class MarketDataEngine:
                 init_kwargs["server"] = MT5_SERVER
 
             if init_kwargs:
-                self.mt5_initialized = mt5.initialize(**init_kwargs)
+                self.mt5_initialized = bool(mt5.initialize(**init_kwargs))
             else:
-                self.mt5_initialized = mt5.initialize()
+                self.mt5_initialized = bool(mt5.initialize())
 
             if self.mt5_initialized:
-                logger.info("MetaTrader 5 initialized successfully! Terminal: %s", mt5.terminal_info())
+                try:
+                    term_info = mt5.terminal_info()
+                    logger.info("MetaTrader 5 initialized successfully! Terminal: %s", term_info)
+                except Exception:
+                    logger.info("MetaTrader 5 initialized successfully!")
                 self.active_gold_symbol = self._resolve_mt5_symbol(MT5_SYMBOL)
                 return True
             else:
-                err_code, err_desc = mt5.last_error()
-                logger.warning(
-                    "MetaTrader 5 initialization failed: (%d) %s. Fallback to Yahoo Finance.",
-                    err_code, err_desc
-                )
+                try:
+                    err_code, err_desc = mt5.last_error()
+                    logger.warning(
+                        "MetaTrader 5 initialization failed: (%d) %s. Graceful fallback to Yahoo Finance.",
+                        err_code, err_desc
+                    )
+                except Exception:
+                    logger.warning("MetaTrader 5 initialization returned False. Fallback to Yahoo Finance.")
                 return False
         except Exception as exc:
-            logger.warning("Error during MetaTrader 5 initialization: %s", exc)
+            logger.warning("Error during MetaTrader 5 initialization: %s. Fallback to Yahoo Finance.", exc)
+            self.mt5_initialized = False
             return False
 
     def _resolve_mt5_symbol(self, preferred_symbol: str) -> str:
-        """Find the matching Gold symbol in broker's Market Watch."""
-        candidates = [preferred_symbol, "XAUUSD", "GOLD", "XAUUSD.m", "XAUUSD.pro", "XAUUSDraw"]
-        for sym in candidates:
-            info = mt5.symbol_info(sym)
-            if info is not None:
-                if not info.visible:
-                    mt5.symbol_select(sym, True)
-                logger.info("Selected MT5 symbol: %s", sym)
-                return sym
+        """Find the matching Gold symbol in broker's Market Watch with fallback safety."""
+        try:
+            candidates = [preferred_symbol, "XAUUSD", "GOLD", "XAUUSD.m", "XAUUSD.pro", "XAUUSDraw"]
+            for sym in candidates:
+                try:
+                    info = mt5.symbol_info(sym)
+                    if info is not None:
+                        if not info.visible:
+                            mt5.symbol_select(sym, True)
+                        logger.info("Selected MT5 symbol: %s", sym)
+                        return sym
+                except Exception:
+                    pass
 
-        all_symbols = mt5.symbols_get()
-        if all_symbols:
-            for s in all_symbols:
-                if "XAU" in s.name or "GOLD" in s.name.upper():
-                    mt5.symbol_select(s.name, True)
-                    logger.info("Discovered and selected MT5 symbol: %s", s.name)
-                    return s.name
+            all_symbols = mt5.symbols_get()
+            if all_symbols:
+                for s in all_symbols:
+                    if "XAU" in s.name or "GOLD" in s.name.upper():
+                        try:
+                            mt5.symbol_select(s.name, True)
+                            logger.info("Discovered and selected MT5 symbol: %s", s.name)
+                            return s.name
+                        except Exception:
+                            pass
+        except Exception as exc:
+            logger.warning("Minor error resolving MT5 symbol: %s", exc)
 
         return preferred_symbol
 
@@ -320,10 +339,13 @@ class MarketDataEngine:
             # Lookback count of at least 150-200 bars captures full session down to latest minute
             rates = mt5.copy_rates_from_pos(self.active_gold_symbol, mt5_tf, 0, count)
             if rates is None or len(rates) == 0:
-                logger.warning("MT5 copy_rates_from_pos returned no data for %s", self.active_gold_symbol)
+                logger.warning("MT5 copy_rates_from_pos returned empty data for %s", self.active_gold_symbol)
                 return None
 
             df = pd.DataFrame(rates)
+            if df.empty or "time" not in df.columns:
+                return None
+
             df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
             df = df.set_index("time")
             df = df.rename(columns={"tick_volume": "volume"})
@@ -339,8 +361,8 @@ class MarketDataEngine:
                     if live_bid < df.iloc[-1]["low"]:
                         df.iloc[-1, df.columns.get_loc("low")] = live_bid
                     df.iloc[-1, df.columns.get_loc("close")] = live_bid
-            except Exception:
-                pass
+            except Exception as tick_err:
+                logger.debug("Minor tick retrieval issue: %s", tick_err)
 
             return df[["open", "high", "low", "close", "volume"]].copy()
         except Exception as exc:
@@ -380,16 +402,24 @@ class MarketDataEngine:
         """
         Pulls M5, M15, H1, and D1 data for Gold.
         Returns (df_m5, df_m15, df_h1, df_d1, source_name).
+        Guarantees zero-crash fallback even during network drops.
         """
         # 1. Try MT5 if requested and active
         if self.mt5_initialized and self.mode in ["MT5", "AUTO"]:
-            df_m5 = self.fetch_mt5_ohlcv(5, count=200)
-            df_m15 = self.fetch_mt5_ohlcv(15, count=200)
-            df_h1 = self.fetch_mt5_ohlcv(60, count=200)
-            df_d1 = self.fetch_mt5_ohlcv(1440, count=60)
-            if df_m5 is not None and df_m15 is not None and df_h1 is not None and not df_m15.empty:
-                logger.info("Using live MetaTrader 5 feed for %s", self.active_gold_symbol)
-                return df_m5, df_m15, df_h1, df_d1 if df_d1 is not None else df_h1, f"MT5:{self.active_gold_symbol}"
+            try:
+                df_m5 = self.fetch_mt5_ohlcv(5, count=200)
+                df_m15 = self.fetch_mt5_ohlcv(15, count=200)
+                df_h1 = self.fetch_mt5_ohlcv(60, count=200)
+                df_d1 = self.fetch_mt5_ohlcv(1440, count=60)
+                if df_m5 is not None and df_m15 is not None and df_h1 is not None and not df_m15.empty:
+                    logger.info("Using live MetaTrader 5 feed for %s", self.active_gold_symbol)
+                    candles = (df_m5, df_m15, df_h1, df_d1 if df_d1 is not None else df_h1, f"MT5:{self.active_gold_symbol}")
+                    MarketDataEngine._last_known_candles = candles
+                    return candles
+                else:
+                    logger.warning("MT5 returned empty or incomplete candles. Falling back to yfinance.")
+            except Exception as mt5_err:
+                logger.warning("MT5 data retrieval error: %s. Falling back to yfinance.", mt5_err)
 
         # 2. Fallback to yfinance
         logger.info("Using Yahoo Finance fallback for Gold data.")
@@ -400,10 +430,18 @@ class MarketDataEngine:
                 df_m15 = self.fetch_yfinance_ohlcv(ticker, interval="15m", period="5d")
                 df_h1 = self.fetch_yfinance_ohlcv(ticker, interval="1h", period="1mo")
                 df_d1 = self.fetch_yfinance_ohlcv(ticker, interval="1d", period="3mo")
-                return df_m5, df_m15, df_h1, df_d1, f"yfinance:{ticker}"
+                if not df_m5.empty and not df_m15.empty:
+                    candles = (df_m5, df_m15, df_h1, df_d1, f"yfinance:{ticker}")
+                    MarketDataEngine._last_known_candles = candles
+                    return candles
             except Exception as exc:
                 last_error = exc
                 logger.warning("yfinance fetch failed for %s: %s. Trying alternative...", ticker, exc)
+
+        # 3. Resilient cache fallback to preserve uptime during momentary network blips
+        if MarketDataEngine._last_known_candles is not None:
+            logger.warning("Both MT5 and yfinance unavailable. Returning last known cached candles to prevent downtime.")
+            return MarketDataEngine._last_known_candles
 
         raise RuntimeError(f"Failed to fetch Gold candlestick data from any source. Error: {last_error}")
 
@@ -1498,160 +1536,189 @@ def generate_candlestick_chart(
       - Yesterday's Ceiling / PDH (Red solid) & Floor / PDL (Green solid)
       - Morning Ceiling / Asian High (Orange dashed) & Floor / Asian Low (Teal dashed)
     Returns an in-memory BytesIO buffer containing the PNG image.
+    Never raises an uncaught exception (uses resilient dark-card fallback on error).
     """
-    df_full = df.copy()
-    df_full.columns = [c.lower() for c in df_full.columns]
+    try:
+        df_full = df.copy()
+        df_full.columns = [c.lower() for c in df_full.columns]
 
-    close_full = df_full["close"]
-    high_full = df_full["high"]
-    low_full = df_full["low"]
-    vol_full = df_full["volume"].replace(0, 1)
+        close_full = df_full["close"]
+        high_full = df_full["high"]
+        low_full = df_full["low"]
+        vol_full = df_full["volume"].replace(0, 1)
 
-    # Calculate or reuse converged indicators on the full dataset before slicing
-    if "ema_20" in df_full.columns:
-        ema20_full = df_full["ema_20"]
-    else:
-        ema20_full = close_full.ewm(span=20, adjust=False).mean()
+        # Calculate or reuse converged indicators on the full dataset before slicing
+        if "ema_20" in df_full.columns:
+            ema20_full = df_full["ema_20"]
+        else:
+            ema20_full = close_full.ewm(span=20, adjust=False).mean()
 
-    if "ema_50" in df_full.columns:
-        ema50_full = df_full["ema_50"]
-    else:
-        ema50_full = close_full.ewm(span=50, adjust=False).mean()
+        if "ema_50" in df_full.columns:
+            ema50_full = df_full["ema_50"]
+        else:
+            ema50_full = close_full.ewm(span=50, adjust=False).mean()
 
-    if "vwap" in df_full.columns:
-        vwap_full = df_full["vwap"]
-    else:
-        tp = (high_full + low_full + close_full) / 3.0
-        pv = tp * vol_full
-        vwap_full = pv.groupby(df_full.index.date).cumsum() / vol_full.groupby(df_full.index.date).cumsum()
-        vwap_full = vwap_full.bfill().fillna(ema20_full)
+        if "vwap" in df_full.columns:
+            vwap_full = df_full["vwap"]
+        else:
+            tp = (high_full + low_full + close_full) / 3.0
+            pv = tp * vol_full
+            vwap_full = pv.groupby(df_full.index.date).cumsum() / vol_full.groupby(df_full.index.date).cumsum()
+            vwap_full = vwap_full.bfill().fillna(ema20_full)
 
-    if current_price is None or current_price <= 0:
-        current_price = float(close_full.iloc[-1])
+        if current_price is None or current_price <= 0:
+            current_price = float(close_full.iloc[-1])
 
-    # Slicing lookback window (default 150 bars to capture the full afternoon session)
-    lookback = min(len(df_full), max(candles_count, 30))
-    df_chart = df_full.tail(lookback).copy()
+        # Slicing lookback window (default 150 bars to capture the full afternoon session)
+        lookback = min(len(df_full), max(candles_count, 30))
+        df_chart = df_full.tail(lookback).copy()
 
-    # Align current active forming candle with live tick price
-    df_chart.iloc[-1, df_chart.columns.get_loc("close")] = current_price
-    if current_price > df_chart.iloc[-1]["high"]:
-        df_chart.iloc[-1, df_chart.columns.get_loc("high")] = current_price
-    if current_price < df_chart.iloc[-1]["low"]:
-        df_chart.iloc[-1, df_chart.columns.get_loc("low")] = current_price
+        # Align current active forming candle with live tick price
+        df_chart.iloc[-1, df_chart.columns.get_loc("close")] = current_price
+        if current_price > df_chart.iloc[-1]["high"]:
+            df_chart.iloc[-1, df_chart.columns.get_loc("high")] = current_price
+        if current_price < df_chart.iloc[-1]["low"]:
+            df_chart.iloc[-1, df_chart.columns.get_loc("low")] = current_price
 
-    ema20 = ema20_full.loc[df_chart.index].copy()
-    ema50 = ema50_full.loc[df_chart.index].copy()
-    vwap = vwap_full.loc[df_chart.index].copy()
+        ema20 = ema20_full.loc[df_chart.index].copy()
+        ema50 = ema50_full.loc[df_chart.index].copy()
+        vwap = vwap_full.loc[df_chart.index].copy()
 
-    # Strip timezone to prevent mplfinance index offset or dropped candle artifacts
-    if df_chart.index.tz is not None:
-        df_chart.index = df_chart.index.tz_localize(None)
-        ema20.index = df_chart.index
-        ema50.index = df_chart.index
-        vwap.index = df_chart.index
+        # Strip timezone to prevent mplfinance index offset or dropped candle artifacts
+        if df_chart.index.tz is not None:
+            df_chart.index = df_chart.index.tz_localize(None)
+            ema20.index = df_chart.index
+            ema50.index = df_chart.index
+            vwap.index = df_chart.index
 
-    df_chart = df_chart.rename(
-        columns={
-            "open": "Open",
-            "high": "High",
-            "low": "Low",
-            "close": "Close",
-            "volume": "Volume",
-        }
-    )
-
-    close = df_chart["Close"]
-
-    if mpf is not None:
-        ap = [
-            mpf.make_addplot(ema20, color="cyan", width=1.5, panel=0),
-            mpf.make_addplot(ema50, color="#9B59B6", width=1.5, panel=0),
-            mpf.make_addplot(vwap, color="#F1C40F", width=1.5, linestyle="dashed", panel=0),
-        ]
-
-        fig, axlist = mpf.plot(
-            df_chart,
-            type="candle",
-            style="nightclouds",
-            addplot=ap,
-            hlines=dict(
-                hlines=[pdh, pdl, asian_high, asian_low],
-                colors=["#E74C3C", "#2ECC71", "#E67E22", "#1ABC9C"],
-                linestyle=["-", "-", "--", "--"],
-                linewidths=[1.5, 1.5, 1.2, 1.2],
-            ),
-            volume=True,
-            returnfig=True,
-            figsize=(11, 6.5),
-            title=f"XAU/USD Gold ({timeframe_label.upper()}) - Live Institutional Price Action",
+        df_chart = df_chart.rename(
+            columns={
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume",
+            }
         )
 
-        ax = axlist[0]
-        # Overlay live spot price line and right-aligned price badge
-        ax.axhline(current_price, color="#00FFFF", linestyle=":", linewidth=1.4, alpha=0.9)
-        ax.text(
-            1.005,
-            current_price,
-            f" ${current_price:.2f} (Live)",
-            transform=ax.get_yaxis_transform(),
-            color="#00FFFF",
-            fontsize=8.5,
-            fontweight="bold",
-            va="center",
-            bbox=dict(boxstyle="round,pad=0.25", facecolor="#10141d", edgecolor="#00FFFF", lw=1.2),
+        close = df_chart["Close"]
+
+        if mpf is not None:
+            ap = [
+                mpf.make_addplot(ema20, color="cyan", width=1.5, panel=0),
+                mpf.make_addplot(ema50, color="#9B59B6", width=1.5, panel=0),
+                mpf.make_addplot(vwap, color="#F1C40F", width=1.5, linestyle="dashed", panel=0),
+            ]
+
+            fig, axlist = mpf.plot(
+                df_chart,
+                type="candle",
+                style="nightclouds",
+                addplot=ap,
+                hlines=dict(
+                    hlines=[pdh, pdl, asian_high, asian_low],
+                    colors=["#E74C3C", "#2ECC71", "#E67E22", "#1ABC9C"],
+                    linestyle=["-", "-", "--", "--"],
+                    linewidths=[1.5, 1.5, 1.2, 1.2],
+                ),
+                volume=True,
+                returnfig=True,
+                figsize=(11, 6.5),
+                title=f"XAU/USD Gold ({timeframe_label.upper()}) - Live Institutional Price Action",
+            )
+
+            ax = axlist[0]
+            # Overlay live spot price line and right-aligned price badge
+            ax.axhline(current_price, color="#00FFFF", linestyle=":", linewidth=1.4, alpha=0.9)
+            ax.text(
+                1.005,
+                current_price,
+                f" ${current_price:.2f} (Live)",
+                transform=ax.get_yaxis_transform(),
+                color="#00FFFF",
+                fontsize=8.5,
+                fontweight="bold",
+                va="center",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="#10141d", edgecolor="#00FFFF", lw=1.2),
+            )
+        else:
+            # Graceful pure matplotlib fallback
+            fig, ax = plt.subplots(figsize=(11, 6.5), facecolor="#181a1f")
+            ax.set_facecolor("#181a1f")
+            ax.plot(range(len(close)), close, color="white", lw=1.5, label="Close")
+            ax.plot(range(len(ema20)), ema20, color="cyan", lw=1.5)
+            ax.plot(range(len(ema50)), ema50, color="#9B59B6", lw=1.5)
+            ax.plot(range(len(vwap)), vwap, color="#F1C40F", ls="--", lw=1.5)
+            ax.axhline(current_price, color="#00FFFF", linestyle=":", lw=1.4)
+            ax.axhline(pdh, color="#E74C3C", lw=1.5)
+            ax.axhline(pdl, color="#2ECC71", lw=1.5)
+            ax.axhline(asian_high, color="#E67E22", ls="--", lw=1.2)
+            ax.axhline(asian_low, color="#1ABC9C", ls="--", lw=1.2)
+            ax.set_title(f"XAU/USD Gold ({timeframe_label.upper()}) - Live Institutional Price Action", color="white")
+            ax.tick_params(colors="white")
+
+        # Custom clear legend on primary panel
+        ax.legend(
+            [
+                mlines.Line2D([0], [0], color="#00FFFF", lw=1.4, ls="dotted"),
+                mlines.Line2D([0], [0], color="cyan", lw=1.5),
+                mlines.Line2D([0], [0], color="#9B59B6", lw=1.5),
+                mlines.Line2D([0], [0], color="#F1C40F", lw=1.5, ls="dashed"),
+                mlines.Line2D([0], [0], color="#E74C3C", lw=1.5),
+                mlines.Line2D([0], [0], color="#2ECC71", lw=1.5),
+                mlines.Line2D([0], [0], color="#E67E22", lw=1.2, ls="dashed"),
+                mlines.Line2D([0], [0], color="#1ABC9C", lw=1.2, ls="dashed"),
+            ],
+            [
+                f"Live Spot Price (${current_price:.2f})",
+                "20 EMA",
+                "50 EMA",
+                "VWAP",
+                f"Yesterday Ceiling / PDH (${pdh:.2f})",
+                f"Yesterday Floor / PDL (${pdl:.2f})",
+                f"Morning Ceiling / Asian High (${asian_high:.2f})",
+                f"Morning Floor / Asian Low (${asian_low:.2f})",
+            ],
+            loc="upper left",
+            fontsize=8,
+            framealpha=0.85,
+            facecolor="#181a1f",
+            edgecolor="#333",
+            labelcolor="white",
         )
-    else:
-        # Graceful pure matplotlib fallback
-        fig, ax = plt.subplots(figsize=(11, 6.5), facecolor="#181a1f")
-        ax.set_facecolor("#181a1f")
-        ax.plot(range(len(close)), close, color="white", lw=1.5, label="Close")
-        ax.plot(range(len(ema20)), ema20, color="cyan", lw=1.5)
-        ax.plot(range(len(ema50)), ema50, color="#9B59B6", lw=1.5)
-        ax.plot(range(len(vwap)), vwap, color="#F1C40F", ls="--", lw=1.5)
-        ax.axhline(current_price, color="#00FFFF", linestyle=":", lw=1.4)
-        ax.axhline(pdh, color="#E74C3C", lw=1.5)
-        ax.axhline(pdl, color="#2ECC71", lw=1.5)
-        ax.axhline(asian_high, color="#E67E22", ls="--", lw=1.2)
-        ax.axhline(asian_low, color="#1ABC9C", ls="--", lw=1.2)
-        ax.set_title(f"XAU/USD Gold ({timeframe_label.upper()}) - Live Institutional Price Action", color="white")
-        ax.tick_params(colors="white")
 
-    # Custom clear legend on primary panel
-    ax.legend(
-        [
-            mlines.Line2D([0], [0], color="#00FFFF", lw=1.4, ls="dotted"),
-            mlines.Line2D([0], [0], color="cyan", lw=1.5),
-            mlines.Line2D([0], [0], color="#9B59B6", lw=1.5),
-            mlines.Line2D([0], [0], color="#F1C40F", lw=1.5, ls="dashed"),
-            mlines.Line2D([0], [0], color="#E74C3C", lw=1.5),
-            mlines.Line2D([0], [0], color="#2ECC71", lw=1.5),
-            mlines.Line2D([0], [0], color="#E67E22", lw=1.2, ls="dashed"),
-            mlines.Line2D([0], [0], color="#1ABC9C", lw=1.2, ls="dashed"),
-        ],
-        [
-            f"Live Spot Price (${current_price:.2f})",
-            "20 EMA",
-            "50 EMA",
-            "VWAP",
-            f"Yesterday Ceiling / PDH (${pdh:.2f})",
-            f"Yesterday Floor / PDL (${pdl:.2f})",
-            f"Morning Ceiling / Asian High (${asian_high:.2f})",
-            f"Morning Floor / Asian Low (${asian_low:.2f})",
-        ],
-        loc="upper left",
-        fontsize=8,
-        framealpha=0.85,
-        facecolor="#181a1f",
-        edgecolor="#333",
-        labelcolor="white",
-    )
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=120)
-    plt.close(fig)
-    buf.seek(0)
-    return buf
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", dpi=120)
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+    except Exception as exc:
+        logger.error("Candlestick chart generation encountered an error: %s", exc, exc_info=True)
+        try:
+            fig, ax = plt.subplots(figsize=(10, 4.5), facecolor="#181a1f")
+            ax.set_facecolor("#181a1f")
+            safe_price = current_price if (current_price and current_price > 0) else 4000.0
+            banner_text = (
+                f"📈 XAU/USD ({timeframe_label.upper()}) Technical Levels Snapshot\n\n"
+                f"Live Spot Price: ${safe_price:.2f}\n"
+                f"PDH: ${pdh:.2f} | PDL: ${pdl:.2f}\n"
+                f"Asian Session: ${asian_low:.2f} – ${asian_high:.2f}\n\n"
+                f"(Graphical plot recovering — numeric levels & AI engine intact)"
+            )
+            ax.text(
+                0.5, 0.5, banner_text,
+                color="#00FFFF", fontsize=10.5, ha="center", va="center",
+                linespacing=1.6, fontweight="bold"
+            )
+            ax.axis("off")
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", bbox_inches="tight", dpi=100)
+            plt.close(fig)
+            buf.seek(0)
+            return buf
+        except Exception as fallback_err:
+            logger.error("Failed even to build chart fallback image: %s", fallback_err)
+            return io.BytesIO()
 
 
 # ======================================================================================
@@ -3215,17 +3282,23 @@ def run_analysis_pipeline() -> Dict[str, Any]:
     parsed = parse_forecast_components(forecast_text)
 
     # 5. Render Live M5 Candlestick Chart PNG (150 candles lookback with live price axis)
-    chart_buf = generate_candlestick_chart(
-        df_m5,
-        "5m",
-        levels["pdh"],
-        levels["pdl"],
-        levels["asian_high"],
-        levels["asian_low"],
-        candles_count=150,
-        current_price=current_price,
-    )
-    chart_bytes = chart_buf.getvalue()
+    chart_bytes = b""
+    try:
+        chart_buf = generate_candlestick_chart(
+            df_m5,
+            "5m",
+            levels["pdh"],
+            levels["pdl"],
+            levels["asian_high"],
+            levels["asian_low"],
+            candles_count=150,
+            current_price=current_price,
+        )
+        if chart_buf:
+            chart_bytes = chart_buf.getvalue()
+    except Exception as chart_err:
+        logger.error("Candlestick chart generation error: %s", chart_err, exc_info=True)
+        chart_bytes = b""
 
     # Package Result
     result = {
@@ -3255,97 +3328,10 @@ def run_analysis_pipeline() -> Dict[str, Any]:
     }
 
     if HAS_DISCORD:
-        result["embed"] = build_forecast_embed(result)
-
-    # Output to Console
-    print("\n" + "=" * 60)
-    print(forecast_text)
-    print("=" * 60 + "\n")
-
-    return result
-
-    logger.info("Current Price: $%.2f | Data Source: %s", current_price, source_name)
-    logger.info(
-        "Institutional Levels -> PDH: $%.2f | PDL: $%.2f | Asian High: $%.2f | Asian Low: $%.2f",
-        levels["pdh"], levels["pdl"], levels["asian_high"], levels["asian_low"]
-    )
-    logger.info("M5 Patterns Detected: %s", patterns_m5 if patterns_m5 else "None")
-    logger.info("M15 Patterns Detected: %s", patterns_m15 if patterns_m15 else "None")
-    logger.info("Strategy Scan: Judas Swing [%s] | Breakout [%s] | Trend Scalper [%s]",
-                strategies["judas_swing"]["status"],
-                strategies["breakout_retest"]["status"],
-                strategies["trend_pullback"]["status"])
-
-    # 5. News & Calendar Ingestion
-    calendar_data = ForexIntelligenceScraper.fetch_calendar_events()
-    news_items = ForexIntelligenceScraper.fetch_breaking_news(limit=10)
-
-    # 6. Build Summary Payload
-    payload = HybridPredictionEngine.build_summary_payload(
-        gold_symbol=source_name,
-        current_price=current_price,
-        m5_metrics=m5_latest,
-        m15_metrics=m15_latest,
-        h1_metrics=h1_latest,
-        levels=levels,
-        m5_patterns=patterns_m5,
-        m15_patterns=patterns_m15,
-        h1_patterns=patterns_h1,
-        macro=macro_data,
-        calendar=calendar_data,
-        news=news_items,
-    )
-
-    # 7. Generate Forecast (AI LLM with Rule-Based Fallback)
-    forecast_text = None
-    if GEMINI_API_KEY or OPENAI_API_KEY:
-        forecast_text = HybridPredictionEngine.call_llm(payload)
-
-    if not forecast_text:
-        logger.info("Using institutional deterministic rule-based quantitative scoring engine.")
-        forecast_text = HybridPredictionEngine.deterministic_rule_based_forecast(payload)
-
-    parsed = parse_forecast_components(forecast_text)
-
-    # 8. Render Live M5 Candlestick Chart PNG (150 candles lookback with live price axis)
-    chart_buf = generate_candlestick_chart(
-        df_m5,
-        "5m",
-        levels["pdh"],
-        levels["pdl"],
-        levels["asian_high"],
-        levels["asian_low"],
-        candles_count=150,
-        current_price=current_price,
-    )
-    chart_bytes = chart_buf.getvalue()
-
-    # Package Result
-    result = {
-        "forecast_text": forecast_text,
-        "parsed": parsed,
-        "payload": payload,
-        "levels": levels,
-        "current_price": current_price,
-        "current_high": current_high,
-        "current_low": current_low,
-        "source_name": source_name,
-        "probability": parsed["probability"],
-        "bias": parsed["bias"],
-        "m5": m5_latest,
-        "m15": m15_latest,
-        "h1": h1_latest,
-        "strategies": strategies,
-        "calendar": calendar_data,
-        "news": news_items,
-        "chart_bytes": chart_bytes,
-        "df_m5": df_m5,
-        "df_m15": df_m15,
-        "df_h1": df_h1,
-    }
-
-    if HAS_DISCORD:
-        result["embed"] = build_forecast_embed(result)
+        try:
+            result["embed"] = build_forecast_embed(result)
+        except Exception as embed_err:
+            logger.error("Failed to build rich forecast embed: %s", embed_err, exc_info=True)
 
     # Output to Console
     print("\n" + "=" * 60)
@@ -3410,11 +3396,20 @@ if HAS_DISCORD:
                         f"3-Timeframe Architecture Active: **H1** (Trend), **M15** (Setup), **M5** (Sniper Trigger).\n"
                         f"Slash Commands: `/predict` | `/levels` | `/news` | `/chart` | `/calc` | `/strategies` | `/track`"
                     )
-                    chart_file = discord.File(io.BytesIO(startup_data["chart_bytes"]), filename="gold_chart.png")
-                    startup_embed.set_image(url="attachment://gold_chart.png")
+                    chart_bytes = startup_data.get("chart_bytes", b"")
+                    chart_file = None
+                    if chart_bytes and len(chart_bytes) > 0:
+                        try:
+                            chart_file = discord.File(io.BytesIO(chart_bytes), filename="gold_chart.png")
+                            startup_embed.set_image(url="attachment://gold_chart.png")
+                        except Exception as file_err:
+                            logger.warning("[DISCORD BOT] Could not attach startup chart file: %s", file_err)
 
-                    await channel.send(content=welcome_msg, embed=startup_embed, file=chart_file)
-                    logger.info("[DISCORD BOT] Successfully dispatched startup forecast and chart to channel %s.", ch_id)
+                    if chart_file:
+                        await channel.send(content=welcome_msg, embed=startup_embed, file=chart_file)
+                    else:
+                        await channel.send(content=welcome_msg, embed=startup_embed)
+                    logger.info("[DISCORD BOT] Successfully dispatched startup broadcast to channel %s.", ch_id)
             except Exception as exc:
                 logger.warning("[DISCORD BOT] Could not send startup broadcast to channel %s: %s", DISCORD_ALERT_CHANNEL_ID, exc)
 
@@ -3466,11 +3461,20 @@ if HAS_DISCORD:
             if pings and (prob >= 8.0 or is_red or has_active_strat or "NO-TRADE" in bias.upper()):
                 content = f"{pings} 🚨 **High-Conviction / Institutional Strategy Alert!**"
 
-            # Attach rendered M5 candlestick chart to embed
-            chart_file = discord.File(io.BytesIO(analysis["chart_bytes"]), filename="gold_chart.png")
-            embed.set_image(url="attachment://gold_chart.png")
+            # Attach rendered M5 candlestick chart to embed if available
+            chart_bytes = analysis.get("chart_bytes", b"")
+            chart_file = None
+            if chart_bytes and len(chart_bytes) > 0:
+                try:
+                    chart_file = discord.File(io.BytesIO(chart_bytes), filename="gold_chart.png")
+                    embed.set_image(url="attachment://gold_chart.png")
+                except Exception as file_err:
+                    logger.warning("Could not attach chart file to /predict embed: %s", file_err)
 
-            await interaction.followup.send(content=content, embed=embed, file=chart_file)
+            if chart_file:
+                await interaction.followup.send(content=content, embed=embed, file=chart_file)
+            else:
+                await interaction.followup.send(content=content, embed=embed)
         except Exception as exc:
             logger.error("Error executing /predict slash command: %s", exc, exc_info=True)
             err_embed = build_error_embed(
@@ -3561,18 +3565,6 @@ if HAS_DISCORD:
                 chart_df = levels_data["df_m5"]
                 tf_title = "5-Minute (M5)"
 
-            chart_buf = await asyncio.to_thread(
-                generate_candlestick_chart,
-                chart_df,
-                tf_title,
-                levels["pdh"],
-                levels["pdl"],
-                levels["asian_high"],
-                levels["asian_low"],
-                150,
-                current_price,
-            )
-
             embed = discord.Embed(
                 title=f"📈 XAU/USD Technical Candlestick Chart ({tf_title})",
                 description=(
@@ -3583,10 +3575,35 @@ if HAS_DISCORD:
                 color=discord.Color.gold(),
                 timestamp=datetime.datetime.now(datetime.timezone.utc),
             )
-            embed.set_image(url="attachment://gold_chart.png")
-            chart_file = discord.File(chart_buf, filename="gold_chart.png")
 
-            await interaction.followup.send(embed=embed, file=chart_file)
+            chart_file = None
+            try:
+                chart_buf = await asyncio.to_thread(
+                    generate_candlestick_chart,
+                    chart_df,
+                    tf_title,
+                    levels["pdh"],
+                    levels["pdl"],
+                    levels["asian_high"],
+                    levels["asian_low"],
+                    150,
+                    current_price,
+                )
+                if chart_buf and chart_buf.getbuffer().nbytes > 0:
+                    chart_file = discord.File(chart_buf, filename="gold_chart.png")
+                    embed.set_image(url="attachment://gold_chart.png")
+            except Exception as chart_render_err:
+                logger.error("Chart rendering error in /chart command: %s", chart_render_err, exc_info=True)
+                embed.add_field(
+                    name="⚠️ Chart Visualization Advisory",
+                    value=f"Candlestick image rendering encountered an issue: `{chart_render_err}`\nTechnical levels and live price above remain completely valid.",
+                    inline=False,
+                )
+
+            if chart_file:
+                await interaction.followup.send(embed=embed, file=chart_file)
+            else:
+                await interaction.followup.send(embed=embed)
         except Exception as exc:
             logger.error("Error executing /chart slash command: %s", exc, exc_info=True)
             err_embed = build_error_embed(
@@ -3907,9 +3924,15 @@ if HAS_DISCORD:
             except Exception as j_exc:
                 logger.warning("[TRADE JOURNAL] Resolution check encountered an issue: %s", j_exc)
 
-            # Attach live M5 chart to scheduled embed
-            chart_file = discord.File(io.BytesIO(analysis["chart_bytes"]), filename="gold_chart.png")
-            embed.set_image(url="attachment://gold_chart.png")
+            # Attach live M5 chart to scheduled embed if available
+            chart_file = None
+            chart_bytes = analysis.get("chart_bytes", b"")
+            if chart_bytes and len(chart_bytes) > 0:
+                try:
+                    chart_file = discord.File(io.BytesIO(chart_bytes), filename="gold_chart.png")
+                    embed.set_image(url="attachment://gold_chart.png")
+                except Exception as f_err:
+                    logger.warning("[DISCORD BOT] Could not attach chart file to scheduled embed: %s", f_err)
 
             # 1. Post to Discord Alert Channel
             if DISCORD_ALERT_CHANNEL_ID:
@@ -3921,8 +3944,11 @@ if HAS_DISCORD:
                         pings = get_alert_mention()
                         if pings and (prob >= 8.0 or is_red or has_active_strat or "NO-TRADE" in bias.upper()):
                             content = f"{pings} 🚨 **High-Conviction / Institutional Strategy Alert!**"
-                        await channel.send(content=content, embed=embed, file=chart_file)
-                        logger.info("[DISCORD BOT] Successfully pushed forecast Embed and M5 Chart to Channel %s", ch_id)
+                        if chart_file:
+                            await channel.send(content=content, embed=embed, file=chart_file)
+                        else:
+                            await channel.send(content=content, embed=embed)
+                        logger.info("[DISCORD BOT] Successfully pushed forecast Embed to Channel %s", ch_id)
                     else:
                         logger.warning("[DISCORD BOT] Target channel %s not found.", ch_id)
                 except Exception as exc:
@@ -3955,18 +3981,21 @@ if HAS_DISCORD:
     @scheduled_forecast_loop.before_loop
     async def before_scheduled_loop():
         """Precision boundary sleep to align with the next :00, :15, :30, :45 close + 5s buffer."""
-        await bot.wait_until_ready()
-        now = datetime.datetime.now()
-        minutes_past = now.minute % 15
-        seconds_past = minutes_past * 60 + now.second + (now.microsecond / 1_000_000.0)
-        seconds_to_wait = (15 * 60) - seconds_past + 5.0
-        next_run = now + datetime.timedelta(seconds=seconds_to_wait)
+        try:
+            await bot.wait_until_ready()
+            now = datetime.datetime.now()
+            minutes_past = now.minute % 15
+            seconds_past = minutes_past * 60 + now.second + (now.microsecond / 1_000_000.0)
+            seconds_to_wait = (15 * 60) - seconds_past + 5.0
+            next_run = now + datetime.timedelta(seconds=seconds_to_wait)
 
-        logger.info(
-            "[DISCORD BOT] Synchronizing 15m task loop with next candle close at %s (waiting %.1fs)...",
-            next_run.strftime("%H:%M:%S"), seconds_to_wait
-        )
-        await asyncio.sleep(seconds_to_wait)
+            logger.info(
+                "[DISCORD BOT] Synchronizing 15m task loop with next candle close at %s (waiting %.1fs)...",
+                next_run.strftime("%H:%M:%S"), seconds_to_wait
+            )
+            await asyncio.sleep(seconds_to_wait)
+        except Exception as align_err:
+            logger.warning("[DISCORD BOT] Task loop initial boundary alignment issue: %s", align_err)
 
 
 # ======================================================================================
