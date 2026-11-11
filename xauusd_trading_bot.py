@@ -3379,13 +3379,24 @@ if HAS_DISCORD:
         logger.info("==================================================")
 
         try:
+            # Sync to all active guilds immediately for instantaneous slash command propagation
+            for g in bot.guilds:
+                try:
+                    bot.tree.copy_global_to(guild=g)
+                    await bot.tree.sync(guild=g)
+                    logger.info("Instantly synced %d slash command(s) to guild '%s' (%s).", len(bot.tree.get_commands()), g.name, g.id)
+                except Exception as g_err:
+                    logger.warning("Could not sync commands to guild %s: %s", g.id, g_err)
+
             synced = await bot.tree.sync()
             logger.info("Successfully synced %d Slash Command(s) globally.", len(synced))
         except Exception as exc:
             logger.error("Failed to sync application slash commands: %s", exc)
 
-        # Send an immediate startup test forecast with attached M5 chart to the alert channel
-        if DISCORD_ALERT_CHANNEL_ID:
+        # Dispatch startup forecast asynchronously in the background so on_ready completes instantly
+        async def _dispatch_startup_broadcast():
+            if not DISCORD_ALERT_CHANNEL_ID:
+                return
             try:
                 ch_id = int(DISCORD_ALERT_CHANNEL_ID)
                 channel = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
@@ -3397,9 +3408,8 @@ if HAS_DISCORD:
                     welcome_msg = (
                         f"{pings + ' ' if pings else ''}🟢 **XAU/USD Quantitative Intelligence Bot is now Online!**\n"
                         f"3-Timeframe Architecture Active: **H1** (Trend), **M15** (Setup), **M5** (Sniper Trigger).\n"
-                        f"Slash Commands: `/predict` | `/levels` | `/news` | `/chart` | `/calc` | `/strategies`"
+                        f"Slash Commands: `/predict` | `/levels` | `/news` | `/chart` | `/calc` | `/strategies` | `/track`"
                     )
-                    # Attach live M5 chart to embed
                     chart_file = discord.File(io.BytesIO(startup_data["chart_bytes"]), filename="gold_chart.png")
                     startup_embed.set_image(url="attachment://gold_chart.png")
 
@@ -3408,9 +3418,30 @@ if HAS_DISCORD:
             except Exception as exc:
                 logger.warning("[DISCORD BOT] Could not send startup broadcast to channel %s: %s", DISCORD_ALERT_CHANNEL_ID, exc)
 
+        asyncio.create_task(_dispatch_startup_broadcast())
+
         # Start background 15-minute scheduled forecast loop
         if not scheduled_forecast_loop.is_running():
             scheduled_forecast_loop.start()
+
+    # ----------------------------------------------------------------------------------
+    # GLOBAL TREE ERROR HANDLER (Prevents unhandled interaction drops/timeouts)
+    # ----------------------------------------------------------------------------------
+    @bot.tree.error
+    async def on_tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+        cmd_name = interaction.command.name if interaction.command else "unknown"
+        logger.error("Slash command error on /%s: %s", cmd_name, error, exc_info=True)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
+            err_embed = build_error_embed(
+                title=f"/{cmd_name} Command Advisory",
+                description=f"Command encountered an execution issue:\n`{error}`",
+                hint="Please try again or run `/levels` to verify live feed status."
+            )
+            await interaction.followup.send(embed=err_embed, ephemeral=True)
+        except Exception as handler_err:
+            logger.error("Failed to deliver app command error followup: %s", handler_err)
 
     # ----------------------------------------------------------------------------------
     # SLASH COMMAND: /predict
@@ -3420,7 +3451,7 @@ if HAS_DISCORD:
         description="Run live XAU/USD 3-timeframe forecast (H1 Trend, M15 Setup, M5 Sniper Trigger) with live chart"
     )
     async def predict_command(interaction: discord.Interaction):
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         try:
             analysis = await asyncio.to_thread(run_analysis_pipeline)
             embed = analysis.get("embed") or build_forecast_embed(analysis)
@@ -3457,7 +3488,7 @@ if HAS_DISCORD:
         description="Display live XAU/USD price, institutional levels, strategy preview snippet & indicators"
     )
     async def levels_command(interaction: discord.Interaction):
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         try:
             levels_data = await asyncio.to_thread(fetch_unified_market_intelligence)
             embed = build_levels_embed(levels_data)
@@ -3479,7 +3510,7 @@ if HAS_DISCORD:
         description="Display today's USD High/Medium impact economic events and breaking headlines"
     )
     async def news_command(interaction: discord.Interaction):
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         try:
             calendar_data = await asyncio.to_thread(ForexIntelligenceScraper.fetch_calendar_events)
             news_items = await asyncio.to_thread(ForexIntelligenceScraper.fetch_breaking_news, 10)
@@ -3513,7 +3544,7 @@ if HAS_DISCORD:
         interaction: discord.Interaction,
         timeframe: Optional[app_commands.Choice[str]] = None,
     ):
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         try:
             tf_choice = timeframe.value if timeframe else "5m"
             levels_data = await asyncio.to_thread(fetch_unified_market_intelligence)
@@ -3583,7 +3614,7 @@ if HAS_DISCORD:
         risk_percent: float = 1.0,
         stop_loss_dollars: Optional[float] = None,
     ):
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         try:
             if balance <= 0 or risk_percent <= 0:
                 await interaction.followup.send("❌ **Error:** Balance and risk percentage must be greater than zero.", ephemeral=True)
@@ -3629,7 +3660,7 @@ if HAS_DISCORD:
         description="Scan live XAU/USD setups with live price, VWAP & RSI: Judas Swing, Breakout, EMA Scalper"
     )
     async def strategies_command(interaction: discord.Interaction):
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         try:
             intel = await asyncio.to_thread(fetch_unified_market_intelligence)
             embed = build_strategies_embed(
@@ -3696,7 +3727,7 @@ if HAS_DISCORD:
         trade_id: Optional[int] = None,
         result: Optional[app_commands.Choice[str]] = None,
     ):
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         try:
             action_val = action.value.lower()
 
