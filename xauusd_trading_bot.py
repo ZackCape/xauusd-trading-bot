@@ -303,8 +303,8 @@ class MarketDataEngine:
 
         return preferred_symbol
 
-    def fetch_mt5_ohlcv(self, timeframe_m: int, count: int = 150) -> Optional[pd.DataFrame]:
-        """Fetch OHLCV candlestick data directly from MetaTrader 5."""
+    def fetch_mt5_ohlcv(self, timeframe_m: int, count: int = 200) -> Optional[pd.DataFrame]:
+        """Fetch OHLCV candlestick data directly from MetaTrader 5 with live tick alignment."""
         if not self.mt5_initialized:
             return None
 
@@ -317,6 +317,7 @@ class MarketDataEngine:
         mt5_tf = tf_map.get(timeframe_m, mt5.TIMEFRAME_M15)
 
         try:
+            # Lookback count of at least 150-200 bars captures full session down to latest minute
             rates = mt5.copy_rates_from_pos(self.active_gold_symbol, mt5_tf, 0, count)
             if rates is None or len(rates) == 0:
                 logger.warning("MT5 copy_rates_from_pos returned no data for %s", self.active_gold_symbol)
@@ -327,6 +328,20 @@ class MarketDataEngine:
             df = df.set_index("time")
             df = df.rename(columns={"tick_volume": "volume"})
             df.columns = [c.lower() for c in df.columns]
+
+            # Synchronize active candle close/high/low with live tick if available
+            try:
+                tick = mt5.symbol_info_tick(self.active_gold_symbol)
+                if tick and tick.bid > 0:
+                    live_bid = float(tick.bid)
+                    if live_bid > df.iloc[-1]["high"]:
+                        df.iloc[-1, df.columns.get_loc("high")] = live_bid
+                    if live_bid < df.iloc[-1]["low"]:
+                        df.iloc[-1, df.columns.get_loc("low")] = live_bid
+                    df.iloc[-1, df.columns.get_loc("close")] = live_bid
+            except Exception:
+                pass
+
             return df[["open", "high", "low", "close", "volume"]].copy()
         except Exception as exc:
             logger.warning("Failed to fetch MT5 rates for %s: %s", self.active_gold_symbol, exc)
@@ -368,10 +383,10 @@ class MarketDataEngine:
         """
         # 1. Try MT5 if requested and active
         if self.mt5_initialized and self.mode in ["MT5", "AUTO"]:
-            df_m5 = self.fetch_mt5_ohlcv(5, count=150)
-            df_m15 = self.fetch_mt5_ohlcv(15, count=150)
-            df_h1 = self.fetch_mt5_ohlcv(60, count=150)
-            df_d1 = self.fetch_mt5_ohlcv(1440, count=30)
+            df_m5 = self.fetch_mt5_ohlcv(5, count=200)
+            df_m15 = self.fetch_mt5_ohlcv(15, count=200)
+            df_h1 = self.fetch_mt5_ohlcv(60, count=200)
+            df_d1 = self.fetch_mt5_ohlcv(1440, count=60)
             if df_m5 is not None and df_m15 is not None and df_h1 is not None and not df_m15.empty:
                 logger.info("Using live MetaTrader 5 feed for %s", self.active_gold_symbol)
                 return df_m5, df_m15, df_h1, df_d1 if df_d1 is not None else df_h1, f"MT5:{self.active_gold_symbol}"
@@ -1471,18 +1486,71 @@ def generate_candlestick_chart(
     pdl: float,
     asian_high: float,
     asian_low: float,
-    candles_count: int = 60,
+    candles_count: int = 150,
+    current_price: Optional[float] = None,
 ) -> io.BytesIO:
     """
     Renders a high-resolution dark-themed candlestick chart using mplfinance.
     Overlays:
-      - 20 EMA (Cyan) & 50 EMA (Purple)
-      - Intraday VWAP (Yellow dashed)
+      - Live Current Price Line (Cyan dotted line with price callout badge)
+      - 20 EMA (Cyan) & 50 EMA (Purple) - calculated across full data context
+      - Intraday VWAP (Yellow dashed) - anchored from session start
       - Yesterday's Ceiling / PDH (Red solid) & Floor / PDL (Green solid)
       - Morning Ceiling / Asian High (Orange dashed) & Floor / Asian Low (Teal dashed)
     Returns an in-memory BytesIO buffer containing the PNG image.
     """
-    df_chart = df.tail(candles_count).copy()
+    df_full = df.copy()
+    df_full.columns = [c.lower() for c in df_full.columns]
+
+    close_full = df_full["close"]
+    high_full = df_full["high"]
+    low_full = df_full["low"]
+    vol_full = df_full["volume"].replace(0, 1)
+
+    # Calculate or reuse converged indicators on the full dataset before slicing
+    if "ema_20" in df_full.columns:
+        ema20_full = df_full["ema_20"]
+    else:
+        ema20_full = close_full.ewm(span=20, adjust=False).mean()
+
+    if "ema_50" in df_full.columns:
+        ema50_full = df_full["ema_50"]
+    else:
+        ema50_full = close_full.ewm(span=50, adjust=False).mean()
+
+    if "vwap" in df_full.columns:
+        vwap_full = df_full["vwap"]
+    else:
+        tp = (high_full + low_full + close_full) / 3.0
+        pv = tp * vol_full
+        vwap_full = pv.groupby(df_full.index.date).cumsum() / vol_full.groupby(df_full.index.date).cumsum()
+        vwap_full = vwap_full.bfill().fillna(ema20_full)
+
+    if current_price is None or current_price <= 0:
+        current_price = float(close_full.iloc[-1])
+
+    # Slicing lookback window (default 150 bars to capture the full afternoon session)
+    lookback = min(len(df_full), max(candles_count, 30))
+    df_chart = df_full.tail(lookback).copy()
+
+    # Align current active forming candle with live tick price
+    df_chart.iloc[-1, df_chart.columns.get_loc("close")] = current_price
+    if current_price > df_chart.iloc[-1]["high"]:
+        df_chart.iloc[-1, df_chart.columns.get_loc("high")] = current_price
+    if current_price < df_chart.iloc[-1]["low"]:
+        df_chart.iloc[-1, df_chart.columns.get_loc("low")] = current_price
+
+    ema20 = ema20_full.loc[df_chart.index].copy()
+    ema50 = ema50_full.loc[df_chart.index].copy()
+    vwap = vwap_full.loc[df_chart.index].copy()
+
+    # Strip timezone to prevent mplfinance index offset or dropped candle artifacts
+    if df_chart.index.tz is not None:
+        df_chart.index = df_chart.index.tz_localize(None)
+        ema20.index = df_chart.index
+        ema50.index = df_chart.index
+        vwap.index = df_chart.index
+
     df_chart = df_chart.rename(
         columns={
             "open": "Open",
@@ -1494,16 +1562,6 @@ def generate_candlestick_chart(
     )
 
     close = df_chart["Close"]
-    high = df_chart["High"]
-    low = df_chart["Low"]
-    vol = df_chart["Volume"].replace(0, 1)
-
-    ema20 = close.ewm(span=20, adjust=False).mean()
-    ema50 = close.ewm(span=50, adjust=False).mean()
-    tp = (high + low + close) / 3.0
-    pv = tp * vol
-    vwap = pv.groupby(df_chart.index.date).cumsum() / vol.groupby(df_chart.index.date).cumsum()
-    vwap = vwap.bfill().fillna(ema20)
 
     if mpf is not None:
         ap = [
@@ -1525,29 +1583,44 @@ def generate_candlestick_chart(
             ),
             volume=True,
             returnfig=True,
-            figsize=(10, 6),
-            title=f"XAU/USD Gold ({timeframe_label.upper()}) - Quantitative Institutional Levels",
+            figsize=(11, 6.5),
+            title=f"XAU/USD Gold ({timeframe_label.upper()}) - Live Institutional Price Action",
         )
 
         ax = axlist[0]
+        # Overlay live spot price line and right-aligned price badge
+        ax.axhline(current_price, color="#00FFFF", linestyle=":", linewidth=1.4, alpha=0.9)
+        ax.text(
+            1.005,
+            current_price,
+            f" ${current_price:.2f} (Live)",
+            transform=ax.get_yaxis_transform(),
+            color="#00FFFF",
+            fontsize=8.5,
+            fontweight="bold",
+            va="center",
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="#10141d", edgecolor="#00FFFF", lw=1.2),
+        )
     else:
         # Graceful pure matplotlib fallback
-        fig, ax = plt.subplots(figsize=(10, 6), facecolor="#181a1f")
+        fig, ax = plt.subplots(figsize=(11, 6.5), facecolor="#181a1f")
         ax.set_facecolor("#181a1f")
         ax.plot(range(len(close)), close, color="white", lw=1.5, label="Close")
         ax.plot(range(len(ema20)), ema20, color="cyan", lw=1.5)
         ax.plot(range(len(ema50)), ema50, color="#9B59B6", lw=1.5)
         ax.plot(range(len(vwap)), vwap, color="#F1C40F", ls="--", lw=1.5)
+        ax.axhline(current_price, color="#00FFFF", linestyle=":", lw=1.4)
         ax.axhline(pdh, color="#E74C3C", lw=1.5)
         ax.axhline(pdl, color="#2ECC71", lw=1.5)
         ax.axhline(asian_high, color="#E67E22", ls="--", lw=1.2)
         ax.axhline(asian_low, color="#1ABC9C", ls="--", lw=1.2)
-        ax.set_title(f"XAU/USD Gold ({timeframe_label.upper()}) - Quantitative Institutional Levels", color="white")
+        ax.set_title(f"XAU/USD Gold ({timeframe_label.upper()}) - Live Institutional Price Action", color="white")
         ax.tick_params(colors="white")
 
     # Custom clear legend on primary panel
     ax.legend(
         [
+            mlines.Line2D([0], [0], color="#00FFFF", lw=1.4, ls="dotted"),
             mlines.Line2D([0], [0], color="cyan", lw=1.5),
             mlines.Line2D([0], [0], color="#9B59B6", lw=1.5),
             mlines.Line2D([0], [0], color="#F1C40F", lw=1.5, ls="dashed"),
@@ -1557,6 +1630,7 @@ def generate_candlestick_chart(
             mlines.Line2D([0], [0], color="#1ABC9C", lw=1.2, ls="dashed"),
         ],
         [
+            f"Live Spot Price (${current_price:.2f})",
             "20 EMA",
             "50 EMA",
             "VWAP",
@@ -1567,7 +1641,7 @@ def generate_candlestick_chart(
         ],
         loc="upper left",
         fontsize=8,
-        framealpha=0.8,
+        framealpha=0.85,
         facecolor="#181a1f",
         edgecolor="#333",
         labelcolor="white",
@@ -3140,9 +3214,16 @@ def run_analysis_pipeline() -> Dict[str, Any]:
 
     parsed = parse_forecast_components(forecast_text)
 
-    # 5. Render Live M5 Candlestick Chart PNG
+    # 5. Render Live M5 Candlestick Chart PNG (150 candles lookback with live price axis)
     chart_buf = generate_candlestick_chart(
-        df_m5, "5m", levels["pdh"], levels["pdl"], levels["asian_high"], levels["asian_low"], 60
+        df_m5,
+        "5m",
+        levels["pdh"],
+        levels["pdl"],
+        levels["asian_high"],
+        levels["asian_low"],
+        candles_count=150,
+        current_price=current_price,
     )
     chart_bytes = chart_buf.getvalue()
 
@@ -3226,9 +3307,16 @@ def run_analysis_pipeline() -> Dict[str, Any]:
 
     parsed = parse_forecast_components(forecast_text)
 
-    # 8. Render Live M5 Candlestick Chart PNG
+    # 8. Render Live M5 Candlestick Chart PNG (150 candles lookback with live price axis)
     chart_buf = generate_candlestick_chart(
-        df_m5, "5m", levels["pdh"], levels["pdl"], levels["asian_high"], levels["asian_low"], 60
+        df_m5,
+        "5m",
+        levels["pdh"],
+        levels["pdl"],
+        levels["asian_high"],
+        levels["asian_low"],
+        candles_count=150,
+        current_price=current_price,
     )
     chart_bytes = chart_buf.getvalue()
 
@@ -3450,7 +3538,8 @@ if HAS_DISCORD:
                 levels["pdl"],
                 levels["asian_high"],
                 levels["asian_low"],
-                60,
+                150,
+                current_price,
             )
 
             embed = discord.Embed(
