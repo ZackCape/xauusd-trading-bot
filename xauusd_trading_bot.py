@@ -324,8 +324,8 @@ class MarketDataEngine:
 
             df = pd.DataFrame(rates)
             df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-            df.set_index("time", inplace=True)
-            df.rename(columns={"tick_volume": "volume"}, inplace=True)
+            df = df.set_index("time")
+            df = df.rename(columns={"tick_volume": "volume"})
             df.columns = [c.lower() for c in df.columns]
             return df[["open", "high", "low", "close", "volume"]].copy()
         except Exception as exc:
@@ -2260,7 +2260,7 @@ def build_forecast_embed(analysis: Dict[str, Any]) -> discord.Embed:
     )
 
     embed.add_field(
-        name="🎯 Key Targets & Stop Zones",
+        name="🎯 Key Targets & Dynamic ATR Stop Zones",
         value=(
             f"**Support / Bullish Target:** `${parsed['support']}`\n"
             f"**Resistance / Bearish Target:** `${parsed['resistance']}`\n"
@@ -2290,7 +2290,7 @@ def build_forecast_embed(analysis: Dict[str, Any]) -> discord.Embed:
                 strat_lines.append(f"• **{strat_name}:** {status_badge}\n  └ _{s.get('explanation', 'Inactive')}_")
 
         embed.add_field(
-            name="🧠 Institutional Strategy Scanner",
+            name="🧠 Active Institutional Strategy Signals",
             value="\n".join(strat_lines),
             inline=False,
         )
@@ -2354,8 +2354,22 @@ def build_forecast_embed(analysis: Dict[str, Any]) -> discord.Embed:
     return embed
 
 
+def build_error_embed(title: str, description: str, hint: str = "") -> discord.Embed:
+    """Builds a standardized warning/advisory embed for gracefully handled exceptions."""
+    embed = discord.Embed(
+        title=f"⚠️ {title}",
+        description=description,
+        color=discord.Color.orange(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    if hint:
+        embed.add_field(name="💡 Advisory / Watchdog Notice", value=hint, inline=False)
+    embed.set_footer(text="CapeTrader Quantitative Engine • Fault-Tolerant Watchdog")
+    return embed
+
+
 def build_levels_embed(levels_data: Dict[str, Any]) -> discord.Embed:
-    """Builds a rich Embed showing live technical indicators across M5, M15, and H1."""
+    """Builds a rich Embed showing live technical indicators across M5, M15, and H1, plus a strategy preview snippet."""
     levels = levels_data["levels"]
     m5 = levels_data["m5"]
     m15 = levels_data["m15"]
@@ -2363,13 +2377,48 @@ def build_levels_embed(levels_data: Dict[str, Any]) -> discord.Embed:
     current_price = levels_data["current_price"]
     source_name = levels_data["source_name"]
     macro = levels_data["macro"]
+    strategies = levels_data.get("strategies", {})
+
+    active_count = sum(1 for s in strategies.values() if "ACTIVE" in s.get("status", ""))
+    embed_color = discord.Color.green() if active_count > 0 else discord.Color.blue()
 
     embed = discord.Embed(
         title="🏛️ XAU/USD Institutional Levels & 3-Timeframe Metrics",
         description=f"**Current Price:** `${current_price:.2f}` (Feed: `{source_name}`)",
-        color=discord.Color.blue(),
+        color=embed_color,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
     )
+
+    # 1. Institutional Strategy Status Preview Snippet
+    if strategies:
+        strat_lines = []
+        has_active = False
+        s_order = [
+            ("⚡ 1. Judas Swing", strategies.get("judas_swing", {})),
+            ("🏰 2. Breakout & Retest", strategies.get("breakout_retest", {})),
+            ("🌊 3. Trend Scalper", strategies.get("trend_pullback", {})),
+        ]
+        for name_label, s_data in s_order:
+            st = s_data.get("status", "❌ INACTIVE")
+            dir_str = f" ({s_data['direction']})" if s_data.get("direction") and s_data["direction"] != "NEUTRAL" else ""
+            if "ACTIVE" in st:
+                has_active = True
+                strat_lines.append(
+                    f"• **{name_label}:** {st}{dir_str} — **Entry:** `${s_data.get('entry', 0):.2f}` | **SL:** `${s_data.get('sl', 0):.2f}` | **TP:** `${s_data.get('tp1', 0):.2f}`"
+                )
+            elif "FORMING" in st:
+                strat_lines.append(f"• **{name_label}:** {st}{dir_str} — _{s_data.get('explanation', 'Monitoring setup')}_")
+            else:
+                strat_lines.append(f"• **{name_label}:** {st}")
+
+        if has_active:
+            strat_lines.append("👉 *Active institutional setup detected! Run `/strategies` or `/predict` to execute.*")
+
+        embed.add_field(
+            name="🧠 Institutional Strategy Status Preview",
+            value="\n".join(strat_lines),
+            inline=False,
+        )
 
     embed.add_field(
         name="📊 Institutional Liquidity Zones",
@@ -2429,7 +2478,7 @@ def build_levels_embed(levels_data: Dict[str, Any]) -> discord.Embed:
         inline=False,
     )
 
-    embed.set_footer(text="Antigravity Quantitative Trading Bot • Institutional Metrics")
+    embed.set_footer(text="CapeTrader Quantitative Trading Bot • Institutional Metrics")
     return embed
 
 
@@ -2489,9 +2538,12 @@ def build_news_embed(calendar: Dict[str, Any], news: List[Dict[str, str]]) -> di
 def build_strategies_embed(
     strategies: Dict[str, Dict[str, Any]],
     current_price: float,
-    levels: Dict[str, float]
+    levels: Dict[str, float],
+    m5_metrics: Optional[Dict[str, Any]] = None,
+    m15_metrics: Optional[Dict[str, Any]] = None,
+    source_name: str = "MT5/yfinance",
 ) -> discord.Embed:
-    """Builds a dedicated rich Discord Embed displaying the 3 institutional strategies."""
+    """Builds a dedicated rich Discord Embed displaying the 3 institutional strategies with live technical metrics."""
     active_count = sum(1 for s in strategies.values() if "ACTIVE" in s.get("status", ""))
     forming_count = sum(1 for s in strategies.values() if "FORMING" in s.get("status", ""))
 
@@ -2506,13 +2558,21 @@ def build_strategies_embed(
     else:
         color = discord.Color.blue()
 
+    desc_lines = [
+        f"**Live Gold Price:** `${current_price:.2f}` (Feed: `{source_name}`)"
+    ]
+    if m5_metrics and m15_metrics:
+        desc_lines.append(
+            f"**M5 Sniper Setup:** VWAP `${m5_metrics.get('vwap', 0):.2f}` | 20 EMA `${m5_metrics.get('ema_20', 0):.2f}` | RSI `{m5_metrics.get('rsi_14', 50):.1f}` | ATR `${m5_metrics.get('atr_14', 0):.2f}`\n"
+            f"**M15 Structure:** VWAP `${m15_metrics.get('vwap', 0):.2f}` | 20 EMA `${m15_metrics.get('ema_20', 0):.2f}` | RSI `{m15_metrics.get('rsi_14', 50):.1f}`"
+        )
+    desc_lines.append(
+        f"**Asian Session Range:** `${levels.get('asian_low', 0):.2f}` – `${levels.get('asian_high', 0):.2f}` | **Yesterday:** `${levels.get('pdl', 0):.2f}` – `${levels.get('pdh', 0):.2f}`"
+    )
+
     embed = discord.Embed(
         title="🏛️ XAU/USD Institutional Strategy Scanner",
-        description=(
-            f"**Current Price:** `${current_price:.2f}`\n"
-            f"**Asian Session Range:** `${levels.get('asian_low', 0):.2f}` – `${levels.get('asian_high', 0):.2f}`\n"
-            f"**Yesterday's Range (PDL - PDH):** `${levels.get('pdl', 0):.2f}` – `${levels.get('pdh', 0):.2f}`"
-        ),
+        description="\n".join(desc_lines),
         color=color,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
     )
@@ -2886,25 +2946,49 @@ def build_journal_stats_embed(stats: Dict[str, Any], open_trades: List[Dict[str,
 
 
 # --------------------------------------------------------------------------------------
-# SYNCHRONOUS MARKET DATA PIPELINES
+# SYNCHRONOUS MARKET DATA PIPELINES (UNIFIED MULTI-TIMEFRAME ENGINE)
 # --------------------------------------------------------------------------------------
 
-def run_levels_pipeline() -> Dict[str, Any]:
-    """Synchronous pipeline that computes live institutional levels and 3-timeframe technicals."""
+def fetch_unified_market_intelligence() -> Dict[str, Any]:
+    """
+    Unified multi-timeframe intelligence engine:
+      1. Ingests live tick & candlestick data for M5, M15, H1, D1 and Macro (DXY/US10Y).
+      2. Computes VWAP, 20 EMA, 50 EMA, RSI (14), and ATR (14) across all timeframes.
+      3. Identifies institutional liquidity levels (PDH, PDL, Asian High, Asian Low).
+      4. Evaluates candlestick price action patterns on M5, M15, and H1.
+      5. Runs the Automated 3-Strategy Institutional Scanner (Judas Swing, Breakout & Retest, EMA Scalper).
+    Returns a unified, cross-functional payload shared by /predict, /levels, /strategies, /calc, and /track.
+    """
     engine = MarketDataEngine(mode=DATA_SOURCE)
     df_m5, df_m15, df_h1, df_d1, source_name = engine.get_gold_candles()
     macro_data = engine.get_macro_correlation_data()
 
+    # Calculate indicators on all timeframes
     df_m5 = engine.calculate_indicators(df_m5)
     df_m15 = engine.calculate_indicators(df_m15)
     df_h1 = engine.calculate_indicators(df_h1)
     levels = engine.calculate_institutional_levels(df_m15, df_d1)
+
     current_price = float(df_m5["close"].iloc[-1])
     current_high = float(df_m5["high"].iloc[-1])
     current_low = float(df_m5["low"].iloc[-1])
 
+    # Candlestick Pattern Detection (M5, M15, H1)
+    patterns_m5 = engine.detect_candlestick_patterns(
+        df_m5, levels["pdh"], levels["pdl"], levels["asian_high"], levels["asian_low"], "M5"
+    )
+    patterns_m15 = engine.detect_candlestick_patterns(
+        df_m15, levels["pdh"], levels["pdl"], levels["asian_high"], levels["asian_low"], "M15"
+    )
+    patterns_h1 = engine.detect_candlestick_patterns(
+        df_h1, levels["pdh"], levels["pdl"], levels["asian_high"], levels["asian_low"], "H1"
+    )
+
     m5_latest = {
         "close": round(float(df_m5["close"].iloc[-1]), 2),
+        "open": round(float(df_m5["open"].iloc[-1]), 2),
+        "high": round(float(df_m5["high"].iloc[-1]), 2),
+        "low": round(float(df_m5["low"].iloc[-1]), 2),
         "rsi_14": round(float(df_m5["rsi_14"].iloc[-1]), 1),
         "ema_20": round(float(df_m5["ema_20"].iloc[-1]), 2),
         "ema_50": round(float(df_m5["ema_50"].iloc[-1]), 2),
@@ -2914,6 +2998,9 @@ def run_levels_pipeline() -> Dict[str, Any]:
 
     m15_latest = {
         "close": round(float(df_m15["close"].iloc[-1]), 2),
+        "open": round(float(df_m15["open"].iloc[-1]), 2),
+        "high": round(float(df_m15["high"].iloc[-1]), 2),
+        "low": round(float(df_m15["low"].iloc[-1]), 2),
         "rsi_14": round(float(df_m15["rsi_14"].iloc[-1]), 1),
         "ema_20": round(float(df_m15["ema_20"].iloc[-1]), 2),
         "ema_50": round(float(df_m15["ema_50"].iloc[-1]), 2),
@@ -2923,12 +3010,32 @@ def run_levels_pipeline() -> Dict[str, Any]:
 
     h1_latest = {
         "close": round(float(df_h1["close"].iloc[-1]), 2),
+        "open": round(float(df_h1["open"].iloc[-1]), 2),
+        "high": round(float(df_h1["high"].iloc[-1]), 2),
+        "low": round(float(df_h1["low"].iloc[-1]), 2),
         "rsi_14": round(float(df_h1["rsi_14"].iloc[-1]), 1),
         "ema_20": round(float(df_h1["ema_20"].iloc[-1]), 2),
         "ema_50": round(float(df_h1["ema_50"].iloc[-1]), 2),
         "vwap": round(float(df_h1["vwap"].iloc[-1]), 2),
         "atr_14": round(float(df_h1["atr_14"].iloc[-1]), 2),
     }
+
+    # Evaluate all 3 Institutional Strategies simultaneously
+    strategies = StrategyScanner.scan_all(
+        df_m5=df_m5,
+        df_m15=df_m15,
+        df_h1=df_h1,
+        levels=levels,
+        m5_metrics=m5_latest,
+        m15_metrics=m15_latest,
+        h1_metrics=h1_latest,
+        patterns_m5=patterns_m5,
+        patterns_m15=patterns_m15,
+        current_price=current_price,
+    )
+
+    active_count = sum(1 for s in strategies.values() if "ACTIVE" in s.get("status", ""))
+    forming_count = sum(1 for s in strategies.values() if "FORMING" in s.get("status", ""))
 
     return {
         "levels": levels,
@@ -2943,90 +3050,138 @@ def run_levels_pipeline() -> Dict[str, Any]:
         "df_m5": df_m5,
         "df_m15": df_m15,
         "df_h1": df_h1,
+        "patterns_m5": patterns_m5,
+        "patterns_m15": patterns_m15,
+        "patterns_h1": patterns_h1,
+        "strategies": strategies,
+        "active_strategies_count": active_count,
+        "forming_strategies_count": forming_count,
+        "engine": engine,
     }
+
+
+def run_levels_pipeline() -> Dict[str, Any]:
+    """Compatibility wrapper returning the full unified market intelligence payload."""
+    return fetch_unified_market_intelligence()
 
 
 def run_analysis_pipeline() -> Dict[str, Any]:
     """
     Executes a complete 3-timeframe market intelligence cycle:
-      1. Ingests Gold M5, M15, H1, D1 and Macro (DXY/US10Y) data.
-      2. Calculates indicators, institutional levels, and price patterns on all timeframes.
-      3. Runs the Automated 3-Strategy Institutional Scanner (StrategyScanner).
-      4. Scrapes economic calendar and news headlines.
-      5. Generates prediction (AI LLM or deterministic quant fallback).
-      6. Renders high-resolution live M5 candlestick chart.
-      7. Constructs rich Discord Embed and returns complete analysis dict.
+      1. Evaluates unified market data, technical indicators, institutional levels, and strategies.
+      2. Scrapes economic calendar and news headlines.
+      3. Generates prediction (AI LLM or deterministic quant fallback).
+      4. Renders high-resolution live M5 candlestick chart.
+      5. Constructs rich Discord Embed and returns complete analysis dict.
     """
     logger.info("=" * 70)
     logger.info("STARTING XAU/USD 3-TIMEFRAME QUANT INTELLIGENCE SCAN (M5 / M15 / H1)")
     logger.info("=" * 70)
 
-    # 1. Market Data Ingestion
-    engine = MarketDataEngine(mode=DATA_SOURCE)
-    df_m5, df_m15, df_h1, df_d1, source_name = engine.get_gold_candles()
-    macro_data = engine.get_macro_correlation_data()
+    # 1. Unified Market Intelligence Context
+    unified = fetch_unified_market_intelligence()
+    current_price = unified["current_price"]
+    current_high = unified["current_high"]
+    current_low = unified["current_low"]
+    source_name = unified["source_name"]
+    levels = unified["levels"]
+    m5_latest = unified["m5"]
+    m15_latest = unified["m15"]
+    h1_latest = unified["h1"]
+    strategies = unified["strategies"]
+    patterns_m5 = unified["patterns_m5"]
+    patterns_m15 = unified["patterns_m15"]
+    patterns_h1 = unified["patterns_h1"]
+    macro_data = unified["macro"]
+    df_m5 = unified["df_m5"]
+    df_m15 = unified["df_m15"]
+    df_h1 = unified["df_h1"]
 
-    # 2. Indicators & Institutional Levels
-    df_m5 = engine.calculate_indicators(df_m5)
-    df_m15 = engine.calculate_indicators(df_m15)
-    df_h1 = engine.calculate_indicators(df_h1)
-    levels = engine.calculate_institutional_levels(df_m15, df_d1)
-
-    current_price = float(df_m5["close"].iloc[-1])
-    current_high = float(df_m5["high"].iloc[-1])
-    current_low = float(df_m5["low"].iloc[-1])
-
-    # 3. Candlestick Pattern Detection (M5, M15, H1)
-    patterns_m5 = engine.detect_candlestick_patterns(
-        df_m5, levels["pdh"], levels["pdl"], levels["asian_high"], levels["asian_low"], "M5"
+    logger.info("Current Price: $%.2f | Data Source: %s", current_price, source_name)
+    logger.info(
+        "Institutional Levels -> PDH: $%.2f | PDL: $%.2f | Asian High: $%.2f | Asian Low: $%.2f",
+        levels["pdh"], levels["pdl"], levels["asian_high"], levels["asian_low"]
     )
-    patterns_m15 = engine.detect_candlestick_patterns(
-        df_m15, levels["pdh"], levels["pdl"], levels["asian_high"], levels["asian_low"], "M15"
-    )
-    patterns_h1 = engine.detect_candlestick_patterns(
-        df_h1, levels["pdh"], levels["pdl"], levels["asian_high"], levels["asian_low"], "H1"
-    )
+    logger.info("M5 Patterns Detected: %s", patterns_m5 if patterns_m5 else "None")
+    logger.info("M15 Patterns Detected: %s", patterns_m15 if patterns_m15 else "None")
+    logger.info("Strategy Scan: Judas Swing [%s] | Breakout [%s] | Trend Scalper [%s]",
+                strategies["judas_swing"]["status"],
+                strategies["breakout_retest"]["status"],
+                strategies["trend_pullback"]["status"])
 
-    m5_latest = {
-        "close": round(float(df_m5["close"].iloc[-1]), 2),
-        "rsi_14": round(float(df_m5["rsi_14"].iloc[-1]), 1),
-        "ema_20": round(float(df_m5["ema_20"].iloc[-1]), 2),
-        "ema_50": round(float(df_m5["ema_50"].iloc[-1]), 2),
-        "vwap": round(float(df_m5["vwap"].iloc[-1]), 2),
-        "atr_14": round(float(df_m5["atr_14"].iloc[-1]), 2),
-    }
+    # 2. News & Calendar Ingestion
+    calendar_data = ForexIntelligenceScraper.fetch_calendar_events()
+    news_items = ForexIntelligenceScraper.fetch_breaking_news(limit=10)
 
-    m15_latest = {
-        "close": round(float(df_m15["close"].iloc[-1]), 2),
-        "rsi_14": round(float(df_m15["rsi_14"].iloc[-1]), 1),
-        "ema_20": round(float(df_m15["ema_20"].iloc[-1]), 2),
-        "ema_50": round(float(df_m15["ema_50"].iloc[-1]), 2),
-        "vwap": round(float(df_m15["vwap"].iloc[-1]), 2),
-        "atr_14": round(float(df_m15["atr_14"].iloc[-1]), 2),
-    }
-
-    h1_latest = {
-        "close": round(float(df_h1["close"].iloc[-1]), 2),
-        "rsi_14": round(float(df_h1["rsi_14"].iloc[-1]), 1),
-        "ema_20": round(float(df_h1["ema_20"].iloc[-1]), 2),
-        "ema_50": round(float(df_h1["ema_50"].iloc[-1]), 2),
-        "vwap": round(float(df_h1["vwap"].iloc[-1]), 2),
-        "atr_14": round(float(df_h1["atr_14"].iloc[-1]), 2),
-    }
-
-    # 4. Automated 3-Strategy Detection
-    strategies = StrategyScanner.scan_all(
-        df_m5=df_m5,
-        df_m15=df_m15,
-        df_h1=df_h1,
-        levels=levels,
+    # 3. Build Summary Payload
+    payload = HybridPredictionEngine.build_summary_payload(
+        gold_symbol=source_name,
+        current_price=current_price,
         m5_metrics=m5_latest,
         m15_metrics=m15_latest,
         h1_metrics=h1_latest,
-        patterns_m5=patterns_m5,
-        patterns_m15=patterns_m15,
-        current_price=current_price,
+        levels=levels,
+        m5_patterns=patterns_m5,
+        m15_patterns=patterns_m15,
+        h1_patterns=patterns_h1,
+        macro=macro_data,
+        calendar=calendar_data,
+        news=news_items,
     )
+
+    # 4. Generate Forecast (AI LLM with Rule-Based Fallback)
+    forecast_text = None
+    if GEMINI_API_KEY or OPENAI_API_KEY:
+        forecast_text = HybridPredictionEngine.call_llm(payload)
+
+    if not forecast_text:
+        logger.info("Using institutional deterministic rule-based quantitative scoring engine.")
+        forecast_text = HybridPredictionEngine.deterministic_rule_based_forecast(payload)
+
+    parsed = parse_forecast_components(forecast_text)
+
+    # 5. Render Live M5 Candlestick Chart PNG
+    chart_buf = generate_candlestick_chart(
+        df_m5, "5m", levels["pdh"], levels["pdl"], levels["asian_high"], levels["asian_low"], 60
+    )
+    chart_bytes = chart_buf.getvalue()
+
+    # Package Result
+    result = {
+        "forecast_text": forecast_text,
+        "parsed": parsed,
+        "payload": payload,
+        "levels": levels,
+        "current_price": current_price,
+        "current_high": current_high,
+        "current_low": current_low,
+        "source_name": source_name,
+        "probability": parsed["probability"],
+        "bias": parsed["bias"],
+        "m5": m5_latest,
+        "m15": m15_latest,
+        "h1": h1_latest,
+        "strategies": strategies,
+        "calendar": calendar_data,
+        "news": news_items,
+        "chart_bytes": chart_bytes,
+        "df_m5": df_m5,
+        "df_m15": df_m15,
+        "df_h1": df_h1,
+        "patterns_m5": patterns_m5,
+        "patterns_m15": patterns_m15,
+        "patterns_h1": patterns_h1,
+    }
+
+    if HAS_DISCORD:
+        result["embed"] = build_forecast_embed(result)
+
+    # Output to Console
+    print("\n" + "=" * 60)
+    print(forecast_text)
+    print("=" * 60 + "\n")
+
+    return result
 
     logger.info("Current Price: $%.2f | Data Source: %s", current_price, source_name)
     logger.info(
@@ -3199,24 +3354,34 @@ if HAS_DISCORD:
             await interaction.followup.send(content=content, embed=embed, file=chart_file)
         except Exception as exc:
             logger.error("Error executing /predict slash command: %s", exc, exc_info=True)
-            await interaction.followup.send(f"❌ **Error generating forecast:** `{exc}`", ephemeral=True)
+            err_embed = build_error_embed(
+                title="Forecast Generation Advisory",
+                description=f"Failed to generate intraday forecast:\n`{exc}`",
+                hint="Verify broker tick connection or market status. Watchdog remains active."
+            )
+            await interaction.followup.send(embed=err_embed, ephemeral=True)
 
     # ----------------------------------------------------------------------------------
     # SLASH COMMAND: /levels
     # ----------------------------------------------------------------------------------
     @bot.tree.command(
         name="levels",
-        description="Display live XAU/USD price, institutional levels, and M5/M15/H1 technical indicators"
+        description="Display live XAU/USD price, institutional levels, strategy preview snippet & indicators"
     )
     async def levels_command(interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
         try:
-            levels_data = await asyncio.to_thread(run_levels_pipeline)
+            levels_data = await asyncio.to_thread(fetch_unified_market_intelligence)
             embed = build_levels_embed(levels_data)
             await interaction.followup.send(embed=embed)
         except Exception as exc:
             logger.error("Error executing /levels slash command: %s", exc, exc_info=True)
-            await interaction.followup.send(f"❌ **Error retrieving institutional levels:** `{exc}`", ephemeral=True)
+            err_embed = build_error_embed(
+                title="Institutional Levels Advisory",
+                description=f"Failed to retrieve institutional levels:\n`{exc}`",
+                hint="Market feed or broker is reconnecting. Will retry automatically."
+            )
+            await interaction.followup.send(embed=err_embed, ephemeral=True)
 
     # ----------------------------------------------------------------------------------
     # SLASH COMMAND: /news
@@ -3234,7 +3399,12 @@ if HAS_DISCORD:
             await interaction.followup.send(embed=embed)
         except Exception as exc:
             logger.error("Error executing /news slash command: %s", exc, exc_info=True)
-            await interaction.followup.send(f"❌ **Error retrieving news and calendar:** `{exc}`", ephemeral=True)
+            err_embed = build_error_embed(
+                title="News & Calendar Advisory",
+                description=f"Failed to retrieve economic calendar:\n`{exc}`",
+                hint="Forex Factory / RSS feeds may be experiencing temporary rate limits."
+            )
+            await interaction.followup.send(embed=err_embed, ephemeral=True)
 
     # ----------------------------------------------------------------------------------
     # SLASH COMMAND: /chart
@@ -3258,7 +3428,7 @@ if HAS_DISCORD:
         await interaction.response.defer(thinking=True)
         try:
             tf_choice = timeframe.value if timeframe else "5m"
-            levels_data = await asyncio.to_thread(run_levels_pipeline)
+            levels_data = await asyncio.to_thread(fetch_unified_market_intelligence)
             levels = levels_data["levels"]
             current_price = levels_data["current_price"]
 
@@ -3299,7 +3469,12 @@ if HAS_DISCORD:
             await interaction.followup.send(embed=embed, file=chart_file)
         except Exception as exc:
             logger.error("Error executing /chart slash command: %s", exc, exc_info=True)
-            await interaction.followup.send(f"❌ **Error generating chart:** `{exc}`", ephemeral=True)
+            err_embed = build_error_embed(
+                title="Chart Rendering Advisory",
+                description=f"Could not render technical chart:\n`{exc}`",
+                hint="Verify candlestick feed availability."
+            )
+            await interaction.followup.send(embed=err_embed, ephemeral=True)
 
     # ----------------------------------------------------------------------------------
     # SLASH COMMAND: /calc (MT5 Spot Gold Lot Size & Risk Calculator)
@@ -3334,7 +3509,7 @@ if HAS_DISCORD:
             current_price = None
 
             if stop_loss_dollars is None:
-                levels_data = await asyncio.to_thread(run_levels_pipeline)
+                levels_data = await asyncio.to_thread(fetch_unified_market_intelligence)
                 atr_m5 = levels_data["m5"]["atr_14"]
                 atr_m15 = levels_data["m15"]["atr_14"]
                 current_price = levels_data["current_price"]
@@ -3350,52 +3525,41 @@ if HAS_DISCORD:
             await interaction.followup.send(embed=embed)
         except Exception as exc:
             logger.error("Error executing /calc slash command: %s", exc, exc_info=True)
-            await interaction.followup.send(f"❌ **Error calculating lot size:** `{exc}`", ephemeral=True)
+            err_embed = build_error_embed(
+                title="Calculator Advisory",
+                description=f"Could not calculate lot size from live ATR:\n`{exc}`",
+                hint="You can supply a custom stop_loss_dollars parameter or wait for live tick updates."
+            )
+            await interaction.followup.send(embed=err_embed, ephemeral=True)
 
     # ----------------------------------------------------------------------------------
     # SLASH COMMAND: /strategies (3-Strategy Institutional Scanner)
     # ----------------------------------------------------------------------------------
     @bot.tree.command(
         name="strategies",
-        description="Scan live XAU/USD setups: Asian Judas Swing, London/NY Breakout & Retest, EMA Scalper"
+        description="Scan live XAU/USD setups with live price, VWAP & RSI: Judas Swing, Breakout, EMA Scalper"
     )
     async def strategies_command(interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
         try:
-            levels_data = await asyncio.to_thread(run_levels_pipeline)
-            df_m5 = levels_data["df_m5"]
-            df_m15 = levels_data["df_m15"]
-            df_h1 = levels_data["df_h1"]
-            levels = levels_data["levels"]
-            current_price = levels_data["current_price"]
-
-            engine = MarketDataEngine(mode=DATA_SOURCE)
-            patterns_m5 = engine.detect_candlestick_patterns(
-                df_m5, levels["pdh"], levels["pdl"], levels["asian_high"], levels["asian_low"], "M5"
+            intel = await asyncio.to_thread(fetch_unified_market_intelligence)
+            embed = build_strategies_embed(
+                strategies=intel["strategies"],
+                current_price=intel["current_price"],
+                levels=intel["levels"],
+                m5_metrics=intel["m5"],
+                m15_metrics=intel["m15"],
+                source_name=intel["source_name"],
             )
-            patterns_m15 = engine.detect_candlestick_patterns(
-                df_m15, levels["pdh"], levels["pdl"], levels["asian_high"], levels["asian_low"], "M15"
-            )
-
-            strategies = await asyncio.to_thread(
-                StrategyScanner.scan_all,
-                df_m5=df_m5,
-                df_m15=df_m15,
-                df_h1=df_h1,
-                levels=levels,
-                m5_metrics=levels_data["m5"],
-                m15_metrics=levels_data["m15"],
-                h1_metrics=levels_data["h1"],
-                patterns_m5=patterns_m5,
-                patterns_m15=patterns_m15,
-                current_price=current_price,
-            )
-
-            embed = build_strategies_embed(strategies, current_price, levels)
             await interaction.followup.send(embed=embed)
         except Exception as exc:
             logger.error("Error executing /strategies slash command: %s", exc, exc_info=True)
-            await interaction.followup.send(f"❌ **Error running strategy scan:** `{exc}`", ephemeral=True)
+            err_embed = build_error_embed(
+                title="Strategy Scanner Advisory",
+                description=f"Encountered an issue running the strategy detector:\n`{exc}`",
+                hint="Verify broker tick connection or yfinance availability."
+            )
+            await interaction.followup.send(embed=err_embed, ephemeral=True)
 
     # ----------------------------------------------------------------------------------
     # SLASH COMMAND: /track (Institutional Paper Trading & Auto-Journaling)
@@ -3509,26 +3673,12 @@ if HAS_DISCORD:
             # ACTION: open
             if action_val == "open":
                 strat_id = int(strategy.value) if strategy else 1
-                levels_data = await asyncio.to_thread(run_levels_pipeline)
-                current_price = levels_data["current_price"]
-                atr_m5 = levels_data["m5"]["atr_14"]
-                levels = levels_data["levels"]
-
-                scanned = await asyncio.to_thread(
-                    StrategyScanner.scan_all,
-                    df_m5=levels_data["df_m5"],
-                    df_m15=levels_data["df_m15"],
-                    df_h1=levels_data["df_h1"],
-                    levels=levels,
-                    m5_metrics=levels_data["m5"],
-                    m15_metrics=levels_data["m15"],
-                    h1_metrics=levels_data["h1"],
-                    patterns_m5=[],
-                    patterns_m15=[],
-                    current_price=current_price,
-                )
+                intel = await asyncio.to_thread(fetch_unified_market_intelligence)
+                current_price = intel["current_price"]
+                atr_m5 = intel["m5"]["atr_14"]
+                levels = intel["levels"]
                 strat_keys = {1: "judas_swing", 2: "breakout_retest", 3: "trend_pullback"}
-                strat_info = scanned.get(strat_keys.get(strat_id, "judas_swing"), {})
+                strat_info = intel["strategies"].get(strat_keys.get(strat_id, "judas_swing"), {})
 
                 # Determine direction
                 dir_val = direction.value if direction else None
@@ -3592,7 +3742,12 @@ if HAS_DISCORD:
 
         except Exception as exc:
             logger.error("Error executing /track slash command: %s", exc, exc_info=True)
-            await interaction.followup.send(f"❌ **Error executing /track:** `{exc}`", ephemeral=True)
+            err_embed = build_error_embed(
+                title="Paper Trade Journal Advisory",
+                description=f"Encountered an issue executing /track:\n`{exc}`",
+                hint="Verify parameters and database connectivity."
+            )
+            await interaction.followup.send(embed=err_embed, ephemeral=True)
 
     # ----------------------------------------------------------------------------------
     # BACKGROUND TASK: 15-MINUTE CANDLE CLOSE SYNCHRONIZED LOOP
@@ -3663,6 +3818,19 @@ if HAS_DISCORD:
 
         except Exception as exc:
             logger.error("[DISCORD BOT] Error in scheduled forecast loop: %s", exc, exc_info=True)
+            if DISCORD_ALERT_CHANNEL_ID:
+                try:
+                    ch_id = int(DISCORD_ALERT_CHANNEL_ID)
+                    channel = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
+                    if channel:
+                        err_embed = build_error_embed(
+                            title="Scheduled Watchdog Advisory",
+                            description=f"Temporary issue updating 15m candle close forecast:\n`{exc}`",
+                            hint="Market data feed or broker may be experiencing latency or weekend market closure. The bot watchdog remains active and will automatically retry at the next 15-minute candle boundary.",
+                        )
+                        await channel.send(embed=err_embed)
+                except Exception as send_err:
+                    logger.warning("[DISCORD BOT] Failed to dispatch error embed to alert channel: %s", send_err)
 
     @scheduled_forecast_loop.before_loop
     async def before_scheduled_loop():
