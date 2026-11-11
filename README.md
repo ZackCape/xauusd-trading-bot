@@ -1,116 +1,161 @@
-# 📊 XAU/USD & USD Intraday Quantitative Intelligence Bot
+# 📊 CapeTrader XAU/USD & USD Intraday Quantitative Intelligence Bot
 
-A production-ready automated quantitative intraday trading intelligence engine for **XAU/USD (Spot Gold)** and the **US Dollar (DXY / US10Y)** featuring a full interactive **Discord Bot (`discord.py`)** with Slash Commands, rich color-coded Embeds, and synchronized 15-minute background forecasting.
+A production-grade quantitative intraday trading intelligence engine and 24/7 cloud-hosted Discord bot for **XAU/USD (Spot Gold)** and the **US Dollar (DXY / US10Y)**. Powered by a 3-timeframe institutional hierarchy (H1 Macro Trend, M15 Structure/FVG, M5 Sniper Trigger), an automated 3-strategy scanner, a paper trading auto-journal with win/loss tracking, and a built-in Keep-Alive Flask web server for 24/7 cloud hosting on Render, Replit, or Railway.
 
 ---
 
 ## 🚀 Key Features & Architecture
 
 ### 1. Interactive Discord Bot (`discord.py`)
-- **Slash Commands (`@bot.tree.command`)**:
-  - `/predict` : Runs the full live M15/H1 Gold + DXY/US10Y + News pipeline and replies with a rich color-coded Embed showing the forecast, institutional key levels, detected candlestick patterns, and recommended ATR stop buffer.
-  - `/levels` : Displays live XAU/USD price, Previous Day High/Low (PDH/PDL), Asian Session High/Low (01:00-09:00 CAT), Day-anchored VWAP, 20/50 EMAs, 14m RSI, and 15m/1h ATR.
-  - `/news` : Displays today's USD High/Medium impact economic calendar releases (with minutes remaining) and breaking headlines from ForexLive and FXStreet.
-- **Color-Coded Visual Sentiment**:
-  - 🟢 **Green (`0x2ECC71`)**: BULLISH Bias
-  - 🔴 **Red (`0xE74C3C`)**: BEARISH Bias
-  - 🟡 **Gold (`0xF1C40F`)**: RANGE-BOUND Bias
-  - 🟠 **Orange (`0xE67E22`)**: NO-TRADE NEWS RISK / Red-Folder Warning
-- **Role Pings**:
-  - Configurable `DISCORD_ALERT_ROLE_ID` to notify a trading team or VIP role when a high-conviction setup (`>=8/10` probability) or Red-Folder news risk is triggered.
-- **Non-Blocking Architecture**:
-  - All heavy network requests (MetaTrader 5, Yahoo Finance, Forex Factory, LLM API calls) are wrapped in `asyncio.to_thread()` to ensure the Discord gateway heartbeat is never blocked.
-  - Commands use `interaction.response.defer(thinking=True)` to prevent 3-second interaction timeouts.
+Featuring 7 institutional slash commands registered under `@bot.tree.command`:
+
+| Slash Command | Parameters | Description |
+|---|---|---|
+| `/predict` | *None* | Runs the complete 3-timeframe pipeline, projects the next 1–4 candles with AI/Quant bias, attaches a live high-res M5 candlestick chart, and triggers role pings for high-conviction setups (`>=8/10`). |
+| `/levels` | *None* | Displays live XAU/USD price, Previous Day High/Low (PDH/PDL), Asian Session High/Low (01:00–09:00 CAT), Day-anchored VWAP, 20/50 EMAs, RSI, and ATR buffers. |
+| `/news` | *None* | Scrapes today's USD High/Medium impact economic events (with minutes remaining and Red-Folder warnings) plus breaking headlines from ForexLive and FXStreet. |
+| `/chart` | `timeframe` (5m, 15m, 1h) | Generates and uploads a dark-themed candlestick chart overlaid with 20/50 EMAs, VWAP, PDH/PDL, and Asian High/Low levels. |
+| `/calc` | `balance`, `risk_percent`, `stop_loss_dollars` (optional) | Calculates exact MT5 contract sizing for Spot Gold (Standard, Mini, and Micro Lots), Max Dollar Risk, 1:2 / 1:3 RRR profit projections, and minimum lot size warnings. If stop-loss is omitted, live 1.5x M5 & M15 ATR distances are auto-calculated. |
+| `/strategies` | *None* | Scans live M5, M15, and H1 data across 3 institutional strategies (Asian Judas Swing, Breakout & Retest, EMA/VWAP Trend Scalper) and reports Active Setups, Watch Zones, and Inactive states. |
+| `/track` | `action` (open, close, stats), `strategy` (1, 2, 3), `direction`, `stop_loss`, `take_profit`, `trade_id`, `result` | Paper Trading & Auto-Journaling engine. Logs paper trades into an SQLite database (`journal.db`), monitors them continuously, and calculates strategy win rate % and net points. |
 
 ---
 
-### 2. Dual-Mode Market Data Engine
-- **MetaTrader 5 Terminal Bridge (`DATA_SOURCE = "AUTO"` | `"MT5"`)**:
-  - Zero-latency broker ticks and M15/H1/D1 bars directly from your desktop MT5 terminal.
-  - Automatically resolves broker symbol naming variations (`XAUUSD`, `GOLD`, `XAUUSD.m`, `XAUUSD.pro`).
-- **Yahoo Finance Fallback (`yfinance`)**:
-  - Seamlessly falls back to `GC=F` (Gold Futures) or `XAUUSD=X` if MetaTrader 5 is not running or fails to initialize.
-  - Live correlation feeds for the **US Dollar Index (`DX-Y.NYB`)** and **US 10-Year Treasury Yields (`^TNX`)**.
-- **Institutional Mathematical Indicators & SMC Levels**:
-  - 14-period RSI (Wilder's Smoothing), 20 EMA, 50 EMA, Intraday Day-anchored VWAP, 14-period ATR.
-  - Previous Day High (PDH) & Previous Day Low (PDL).
-  - Asian Session High/Low (01:00 to 09:00 CAT / UTC+2).
-  - Smart Money Concepts (SMC) & Price Action Detector: Bullish/Bearish Engulfing, Hammer/Pinbars, Fair Value Gap (FVG) imbalances, and Liquidity Sweeps above/below Asian H/L or PDH/PDL.
+### 2. Automated 3-Strategy Institutional Engine (`StrategyScanner`)
+- **Strategy 1: Asian Session Liquidity Sweep (Judas Swing)**
+  - *Trigger:* Price wicks above Asian High / PDH (Bearish Sweep) or below Asian Low / PDL (Bullish Sweep), closes back inside the range on M5/M15, and confirms an opposite rejection candle or FVG fill.
+  - *Targets:* Entry at market execution, tight stop beyond the sweep wick, and target at VWAP / opposite side of the Asian range.
+- **Strategy 2: London/NY Breakout & Retest**
+  - *Trigger:* Strong M15 candle body closes cleanly above Asian High/PDH or below Asian Low/PDL with 20 EMA and VWAP alignment, followed by an M5 pullback to retest the broken level.
+  - *Targets:* Retest entry zone, stop-loss 1.5x M5 ATR back inside the broken level, 1:2 RRR target.
+- **Strategy 3: EMA 20/50 + VWAP Trend Pullback Scalper**
+  - *Trigger:* H1 and M15 in clean trend alignment (Price > VWAP > 20 EMA > 50 EMA for Bullish; inverse for Bearish), M5 RSI pulls back to 40–52 (bullish) or 48–60 (bearish), and price prints a rejection/bounce candle near the 20 EMA.
+  - *Targets:* Sniper entry, 1.5x M5 ATR stop-loss, 1:2 and 1:3 RRR take-profit targets.
 
 ---
 
-### 3. Economic Calendar & News Scraper
-- **Forex Factory Calendar JSON**:
-  - Scrapes `https://nfs.faireconomy.media/ff_calendar_thisweek.json` with an in-memory cache to prevent 429 rate limits.
-  - Filters today's **High** and **Medium** impact USD events with exact minutes remaining.
-  - **Red-Folder Alert**: Detects CPI, NFP, PPI, FOMC, or Rate Decisions within 30 minutes.
-- **Breaking Forex Headlines**:
-  - Scrapes and parses latest news from `ForexLive` and `FXStreet` RSS feeds.
+### 3. Paper Trading & Auto-Journaling System (`TradeJournal`)
+- **SQLite Database (`journal.db`)**: Thread-safe database storing Trade ID, Strategy ID, Direction (BUY/SELL), Entry Price, Stop-Loss, Take-Profit, Status (OPEN, WON, LOST), Open/Close Timestamps, and Net Gold Points PnL.
+- **Automatic Hit/Miss Detection (15m Background Loop)**:
+  - During every 15-minute candle close scan, the bot checks all `OPEN` trades against the candle's High, Low, and Close.
+  - If Take-Profit is crossed, the trade is automatically marked as **WON** and a celebratory green embed (`🎉 TAKE-PROFIT HIT!`) is dispatched to the alert channel.
+  - If Stop-Loss is breached, the trade is automatically marked as **LOST** and an alert red embed (`🛑 STOP-LOSS HIT`) is dispatched.
+- **Strategy Win Rate Breakdown (`/track action:stats`)**:
+  - Displays overall win rate %, total closed trades, cumulative Gold points PnL, and individual performance cards for Strategy 1, Strategy 2, and Strategy 3.
+  - Automatically awards the **Top Performing Strategy** banner to the highest win-rate setup.
 
 ---
 
-### 4. Hybrid Prediction Engine (AI LLM + Quant Fallback)
-- **AI LLM API Integration**:
-  - Supports **Google Gemini (`google-genai`)** and **OpenAI (`openai`)** via `.env`.
-  - Analytical rules:
-    1. **Inverse Macro Rule**: Rising DXY + US10Y = Bearish Gold. Falling DXY + US10Y = Bullish Gold.
-    2. **Liquidity Sweep Rule**: Rejection of Asian High/PDH with high RSI = Bearish reversal. Rejection of Asian Low/PDL with low RSI = Bullish reversal.
-    3. **Red-Folder Rule**: High impact event within 30m overrides bias to `"HIGH VOLATILITY WHIPSAW - STAND ASIDE"`.
-- **Deterministic Rule-Based Fallback**:
-  - Operates automatically when no LLM API key is provided, generating the exact required institutional forecast format.
+### 4. 24/7 Cloud Deployment (Render, Replit, Railway) & Keep-Alive Server
+The bot features a built-in lightweight **Flask Keep-Alive web server** that runs in a background daemon thread:
+- Binds to host `0.0.0.0` and uses the dynamic port provided by `PORT` (default `8080`).
+- Root Route (`GET /`): Returns `CapeTrader XAU/USD Intelligence Bot is Alive & Running 24/7 🚀`.
+- Health Check (`GET /health`): Returns JSON health status and UTC timestamp.
+- **Procfile** included: `web: python xauusd_trading_bot.py`.
+- **Render Blueprint** included: `render.yaml`.
+- Seamless **yfinance fallback** when deployed on Linux cloud environments where the desktop MetaTrader 5 terminal is unavailable (`DATA_SOURCE = "AUTO"` or `"YFINANCE"`).
+
+#### Free 24/7 Uptime with UptimeRobot:
+1. Deploy the service to [Render.com](https://render.com) as a Web Service.
+2. Copy your Render web service URL (e.g., `https://xauusd-trading-bot-xxxx.onrender.com`).
+3. Create a free account at [UptimeRobot.com](https://uptimerobot.com).
+4. Add a new monitor:
+   - **Monitor Type:** `HTTP(s)`
+   - **Friendly Name:** `CapeTrader Gold Bot`
+   - **URL (or IP):** `https://xauusd-trading-bot-xxxx.onrender.com/`
+   - **Monitoring Interval:** `5 minutes`
+5. UptimeRobot will ping the Keep-Alive server every 5 minutes, preventing Render's free tier container from sleeping.
 
 ---
 
-### 5. Automated 15-Minute Background Scheduler & Webhook Fallback
-- Synchronizes with every 15-minute candle close (`:00:05`, `:15:05`, `:30:05`, `:45:05`).
-- Pushes the forecast Embed to `DISCORD_ALERT_CHANNEL_ID`.
-- Forwards to `DISCORD_WEBHOOK_URL` and Telegram if configured.
-- Supports `--once` CLI flag for quick diagnostics.
-
----
-
-## 📦 Installation & Setup
+## 📦 Installation & Configuration
 
 ### 1. Install Dependencies
 ```bash
-pip install pandas numpy yfinance requests feedparser schedule python-dotenv discord.py MetaTrader5 google-genai openai
+pip install -r requirements.txt
 ```
 
 ### 2. Configure Environment (`.env`)
-Edit `.env` with your credentials:
+Create a `.env` file in the project root:
 ```ini
+# Market Data Mode: "AUTO" (prefers MT5 on Windows, falls back to yfinance), "MT5", or "YFINANCE"
 DATA_SOURCE=AUTO
 MT5_SYMBOL=XAUUSD
 
 # Discord Bot Credentials
 DISCORD_BOT_TOKEN=your_bot_token_here
-DISCORD_ALERT_CHANNEL_ID=123456789012345678
-DISCORD_ALERT_ROLE_ID=987654321098765432
+DISCORD_ALERT_CHANNEL_ID=your_channel_id_here
+DISCORD_ALERT_ROLE_ID=your_role_id_here
+DISCORD_ALERT_USER_ID=your_user_id_here
+
+# Keep-Alive Web Server (Dynamic Cloud Port)
+PORT=8080
+
+# AI LLM Keys (Optional - falls back to deterministic quant engine if omitted)
+GEMINI_API_KEY=your_gemini_api_key
+GEMINI_MODEL=gemini-3.8-flash
+
+OPENAI_API_KEY=your_openai_api_key
+OPENAI_MODEL=gpt-4o
 
 # Webhook & Telegram Fallback (Optional)
-DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+DISCORD_WEBHOOK_URL=
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
-
-# AI Keys (Optional)
-GEMINI_API_KEY=
-GEMINI_MODEL=gemini-2.5-flash
-
-OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4o
 ```
 
 ---
 
 ## 🏃 Execution Commands
 
-### Diagnostic CLI Run (Single Pass):
+### Diagnostic CLI Single Scan:
 ```bash
 python xauusd_trading_bot.py --once
 ```
 
-### Run Interactive Discord Bot (24/7 Slash Commands & 15m Alerts):
+### Run Bot Locally (Discord Bot + 15m Loop + Keep-Alive Web Server):
 ```bash
 python xauusd_trading_bot.py
 ```
-*(If no `DISCORD_BOT_TOKEN` is found in `.env`, the script automatically falls back to standalone terminal and webhook loop mode).*
+
+---
+
+## 📊 Discord Bot Usage Guide
+
+### 🧮 Calculating Risk & MT5 Lot Size
+```
+/calc balance:500 risk_percent:1.0
+```
+*Calculates exact lot size using live 1.5x M5 & M15 ATR distances.*
+
+```
+/calc balance:1000 risk_percent:2.0 stop_loss_dollars:4.50
+```
+*Calculates contract size for a custom $4.50 stop distance.*
+
+### 🔍 Scanning Institutional Setups
+```
+/strategies
+```
+*Scans Judas Swing, Breakout & Retest, and Trend Pullback.*
+
+### 📝 Paper Trading & Auto-Journaling
+```
+/track action:Open strategy:1
+```
+*Opens a new paper trade for Strategy 1 using live price and ATR parameters.*
+
+```
+/track action:Stats
+```
+*Views the comprehensive performance journal, win rates, and open positions.*
+
+```
+/track action:Close trade_id:1 result:WIN
+```
+*Manually closes paper trade #1 with a winning result.*
+
+---
+
+## 🛡️ License & Disclaimer
+This software is provided for educational and quantitative research purposes only. Trading Spot Gold (XAU/USD) carries significant financial risk. Always practice sound risk management and never risk more capital than you can afford to lose.

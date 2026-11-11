@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -181,6 +182,9 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 DISCORD_ALERT_CHANNEL_ID = os.getenv("DISCORD_ALERT_CHANNEL_ID", "").strip()
 DISCORD_ALERT_ROLE_ID = os.getenv("DISCORD_ALERT_ROLE_ID", "").strip()
 DISCORD_ALERT_USER_ID = os.getenv("DISCORD_ALERT_USER_ID", "").strip()
+
+# Paper Trading & Auto-Journaling Settings
+JOURNAL_DB_PATH = os.getenv("JOURNAL_DB_PATH", "journal.db").strip()
 
 # Webhooks & Telegram Fallback
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
@@ -1158,6 +1162,305 @@ class StrategyScanner:
 
 
 # ======================================================================================
+# MODULE 1.6: PAPER TRADING & AUTO-JOURNALING DATABASE (TradeJournal)
+# ======================================================================================
+
+class TradeJournal:
+    """
+    Thread-safe SQLite Paper Trading & Auto-Journaling System for tracking
+    the 3 institutional XAU/USD setups:
+      1. Asian Session Liquidity Sweep (Judas Swing)
+      2. London/NY Breakout & Retest
+      3. EMA 20/50 + VWAP Trend Pullback Scalper
+
+    Stores paper trades in SQLite (journal.db), calculates win rates and stats,
+    and automatically detects Take-Profit and Stop-Loss triggers during the 15-minute
+    background loop.
+    """
+    DB_PATH = JOURNAL_DB_PATH
+
+    STRATEGY_NAMES = {
+        1: "Asian Session Liquidity Sweep (Judas Swing)",
+        2: "London/NY Breakout & Retest",
+        3: "EMA 20/50 + VWAP Trend Pullback Scalper",
+    }
+
+    @classmethod
+    def _init_db(cls):
+        """Initializes the SQLite database table and indices if they do not exist."""
+        try:
+            with sqlite3.connect(cls.DB_PATH, timeout=10.0) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS journal_trades (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        strategy_id INTEGER NOT NULL,
+                        strategy_name TEXT NOT NULL,
+                        direction TEXT NOT NULL,
+                        entry_price REAL NOT NULL,
+                        stop_loss REAL NOT NULL,
+                        take_profit REAL NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'OPEN',
+                        opened_at TEXT NOT NULL,
+                        closed_at TEXT,
+                        close_price REAL,
+                        pnl_dollars REAL,
+                        notes TEXT
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_journal_status ON journal_trades(status)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_journal_strategy ON journal_trades(strategy_id)
+                """)
+                conn.commit()
+        except Exception as exc:
+            logger.error("[TRADE JOURNAL] Failed to initialize database: %s", exc)
+
+    @classmethod
+    def open_trade(
+        cls,
+        strategy_id: int,
+        direction: str,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+        strategy_name: Optional[str] = None,
+        notes: str = "",
+    ) -> Dict[str, Any]:
+        """Logs a new paper trade with status 'OPEN'."""
+        cls._init_db()
+        name = strategy_name or cls.STRATEGY_NAMES.get(strategy_id, f"Strategy {strategy_id}")
+        direction_clean = direction.upper().strip()
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        with sqlite3.connect(cls.DB_PATH, timeout=10.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO journal_trades (
+                    strategy_id, strategy_name, direction, entry_price,
+                    stop_loss, take_profit, status, opened_at, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+                """,
+                (strategy_id, name, direction_clean, float(entry_price), float(stop_loss), float(take_profit), now_iso, notes)
+            )
+            trade_id = cursor.lastrowid
+            conn.commit()
+
+            cursor.execute("SELECT * FROM journal_trades WHERE id = ?", (trade_id,))
+            row = cursor.fetchone()
+            return dict(row)
+
+    @classmethod
+    def close_trade(
+        cls,
+        trade_id: int,
+        result: str,
+        close_price: Optional[float] = None,
+        notes: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Closes an open paper trade as WON or LOST and calculates Gold point/dollar PnL."""
+        cls._init_db()
+        res_upper = result.upper().strip()
+        final_status = "WON" if ("WIN" in res_upper or "WON" in res_upper) else "LOST"
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        with sqlite3.connect(cls.DB_PATH, timeout=10.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM journal_trades WHERE id = ?", (trade_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            trade = dict(row)
+            entry = float(trade["entry_price"])
+            sl = float(trade["stop_loss"])
+            tp = float(trade["take_profit"])
+            direction = trade["direction"].upper()
+
+            if close_price is None:
+                final_close_price = tp if final_status == "WON" else sl
+            else:
+                final_close_price = float(close_price)
+
+            if direction == "BUY":
+                pnl = round(final_close_price - entry, 2)
+            else:
+                pnl = round(entry - final_close_price, 2)
+
+            cursor.execute(
+                """
+                UPDATE journal_trades
+                SET status = ?, closed_at = ?, close_price = ?, pnl_dollars = ?, notes = COALESCE(?, notes)
+                WHERE id = ?
+                """,
+                (final_status, now_iso, final_close_price, pnl, notes, trade_id)
+            )
+            conn.commit()
+
+            cursor.execute("SELECT * FROM journal_trades WHERE id = ?", (trade_id,))
+            updated_row = cursor.fetchone()
+            return dict(updated_row)
+
+    @classmethod
+    def get_trade(cls, trade_id: int) -> Optional[Dict[str, Any]]:
+        """Fetches a specific trade by ID."""
+        cls._init_db()
+        with sqlite3.connect(cls.DB_PATH, timeout=10.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM journal_trades WHERE id = ?", (trade_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    @classmethod
+    def get_open_trades(cls) -> List[Dict[str, Any]]:
+        """Returns all currently OPEN paper trades."""
+        cls._init_db()
+        with sqlite3.connect(cls.DB_PATH, timeout=10.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM journal_trades WHERE status = 'OPEN' ORDER BY id ASC")
+            rows = cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    @classmethod
+    def get_stats(cls) -> Dict[str, Any]:
+        """Computes comprehensive win rate and performance metrics across the 3 strategies."""
+        cls._init_db()
+        with sqlite3.connect(cls.DB_PATH, timeout=10.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM journal_trades")
+            all_trades = [dict(r) for r in cursor.fetchall()]
+
+        total_trades = len(all_trades)
+        open_trades = [t for t in all_trades if t["status"] == "OPEN"]
+        closed_trades = [t for t in all_trades if t["status"] in ("WON", "LOST")]
+        won_trades = [t for t in closed_trades if t["status"] == "WON"]
+        lost_trades = [t for t in closed_trades if t["status"] == "LOST"]
+
+        closed_count = len(closed_trades)
+        won_count = len(won_trades)
+        lost_count = len(lost_trades)
+        overall_win_rate = (won_count / closed_count * 100.0) if closed_count > 0 else 0.0
+        total_pnl = sum((t["pnl_dollars"] or 0.0) for t in closed_trades)
+
+        breakdown = {}
+        for s_id in (1, 2, 3):
+            s_name = cls.STRATEGY_NAMES[s_id]
+            s_trades = [t for t in closed_trades if t["strategy_id"] == s_id]
+            s_open = [t for t in open_trades if t["strategy_id"] == s_id]
+            s_won = len([t for t in s_trades if t["status"] == "WON"])
+            s_lost = len([t for t in s_trades if t["status"] == "LOST"])
+            s_closed = len(s_trades)
+            s_wr = (s_won / s_closed * 100.0) if s_closed > 0 else 0.0
+            s_pnl = sum((t["pnl_dollars"] or 0.0) for t in s_trades)
+            breakdown[s_id] = {
+                "strategy_id": s_id,
+                "name": s_name,
+                "closed": s_closed,
+                "won": s_won,
+                "lost": s_lost,
+                "open": len(s_open),
+                "win_rate": round(s_wr, 1),
+                "pnl": round(s_pnl, 2),
+            }
+
+        eligible_strategies = [b for b in breakdown.values() if b["closed"] > 0]
+        if eligible_strategies:
+            top = max(eligible_strategies, key=lambda x: (x["win_rate"], x["won"]))
+            top_strategy_text = f"🏆 Strategy {top['strategy_id']}: {top['name']} ({top['win_rate']:.1f}% Win Rate with {top['won']}W / {top['lost']}L)"
+        else:
+            top_strategy_text = "No closed trades recorded yet (monitoring active setups)."
+
+        return {
+            "total_trades": total_trades,
+            "open_trades": len(open_trades),
+            "closed_trades": closed_count,
+            "won_trades": won_count,
+            "lost_trades": lost_count,
+            "win_rate": round(overall_win_rate, 1),
+            "total_pnl": round(total_pnl, 2),
+            "breakdown": breakdown,
+            "top_strategy": top_strategy_text,
+        }
+
+    @classmethod
+    def check_open_trades_against_price(
+        cls,
+        current_price: float,
+        high_price: Optional[float] = None,
+        low_price: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Scans all OPEN paper trades against current candle price range.
+        If Take-Profit or Stop-Loss was breached, automatically marks trade as WON or LOST.
+        Returns list of newly resolved trades for Discord alerting.
+        """
+        open_trades = cls.get_open_trades()
+        if not open_trades:
+            return []
+
+        h = float(high_price) if high_price is not None else float(current_price)
+        l = float(low_price) if low_price is not None else float(current_price)
+        c = float(current_price)
+
+        resolved = []
+        for t in open_trades:
+            t_id = t["id"]
+            direction = t["direction"].upper()
+            sl = float(t["stop_loss"])
+            tp = float(t["take_profit"])
+
+            trade_resolved = False
+            result_status = None
+            resolved_close_price = None
+            resolution_reason = None
+
+            if direction == "BUY":
+                if h >= tp or c >= tp:
+                    trade_resolved = True
+                    result_status = "WON"
+                    resolved_close_price = tp
+                    resolution_reason = f"Take-Profit target (${tp:.2f}) reached by price high (${h:.2f})"
+                elif l <= sl or c <= sl:
+                    trade_resolved = True
+                    result_status = "LOST"
+                    resolved_close_price = sl
+                    resolution_reason = f"Stop-Loss level (${sl:.2f}) breached by price low (${l:.2f})"
+
+            elif direction == "SELL":
+                if l <= tp or c <= tp:
+                    trade_resolved = True
+                    result_status = "WON"
+                    resolved_close_price = tp
+                    resolution_reason = f"Take-Profit target (${tp:.2f}) reached by price low (${l:.2f})"
+                elif h >= sl or c >= sl:
+                    trade_resolved = True
+                    result_status = "LOST"
+                    resolved_close_price = sl
+                    resolution_reason = f"Stop-Loss level (${sl:.2f}) breached by price high (${h:.2f})"
+
+            if trade_resolved and result_status:
+                updated = cls.close_trade(
+                    trade_id=t_id,
+                    result=result_status,
+                    close_price=resolved_close_price,
+                    notes=resolution_reason,
+                )
+                if updated:
+                    updated["resolution_reason"] = resolution_reason
+                    resolved.append(updated)
+
+        return resolved
+
+
+# ======================================================================================
 # CHARTING ENGINE (MPLFINANCE VISUALIZATION)
 # ======================================================================================
 
@@ -1573,7 +1876,7 @@ class HybridPredictionEngine:
         if GEMINI_API_KEY and HAS_GOOGLE_GENAI:
             try:
                 logger.info("Querying Google Gemini API (%s)...", GEMINI_MODEL)
-                client = genai.Client(api_key=GEMINI_API_KEY)
+                client = genai.Client(api_key=GEMINI_API_KEY, http_options={"timeout": 15000})
                 response = client.models.generate_content(
                     model=GEMINI_MODEL,
                     contents=f"Analyze this 3-timeframe market JSON payload:\n\n{payload_str}",
@@ -2416,6 +2719,172 @@ def build_calc_embed(
     return embed
 
 
+def build_trade_open_embed(trade: Dict[str, Any]) -> discord.Embed:
+    """Builds a rich Discord Embed when a new paper trade is opened and tracked."""
+    entry = float(trade["entry_price"])
+    sl = float(trade["stop_loss"])
+    tp = float(trade["take_profit"])
+    direction = trade["direction"].upper()
+    sl_dist = abs(entry - sl)
+    tp_dist = abs(tp - entry)
+    rrr = round(tp_dist / max(0.1, sl_dist), 2)
+
+    color = discord.Color.green() if direction == "BUY" else discord.Color.red()
+    dir_badge = "🟢 BUY (Long)" if direction == "BUY" else "🔴 SELL (Short)"
+
+    embed = discord.Embed(
+        title=f"📝 Paper Trade Logged • Trade #{trade['id']}",
+        description=(
+            f"**Strategy #{trade['strategy_id']}:** `{trade['strategy_name']}`\n"
+            f"**Direction:** `{dir_badge}`\n"
+            f"**Entry Execution:** `${entry:.2f}`\n"
+            f"**Auto-Monitoring:** Active via 15-Minute Candle Close Loop"
+        ),
+        color=color,
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(
+        name="🛡️ Risk & Target Parameters",
+        value=(
+            f"• **Stop-Loss:** `${sl:.2f}` (Risk: `${sl_dist:.2f}`)\n"
+            f"• **Take-Profit:** `${tp:.2f}` (Target: `${tp_dist:.2f}`)\n"
+            f"• **Risk-to-Reward Ratio (RRR):** `1:{rrr:.1f}`"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="CapeTrader Paper Trading & Auto-Journaling System • Status: OPEN")
+    return embed
+
+
+def build_trade_close_embed(trade: Dict[str, Any]) -> discord.Embed:
+    """Builds a Discord Embed when a paper trade is manually closed."""
+    status = trade.get("status", "CLOSED").upper()
+    pnl = trade.get("pnl_dollars", 0.0) or 0.0
+    is_won = status == "WON" or pnl >= 0
+    color = discord.Color.green() if is_won else discord.Color.red()
+    result_icon = "🏆 WIN" if is_won else "🛑 LOSS"
+    pnl_sign = "+" if pnl >= 0 else ""
+
+    embed = discord.Embed(
+        title=f"📁 Paper Trade #{trade['id']} Closed • {result_icon}",
+        description=(
+            f"**Strategy #{trade['strategy_id']}:** `{trade['strategy_name']}`\n"
+            f"**Direction:** `{trade['direction']}`\n"
+            f"**Entry Price:** `${float(trade['entry_price']):.2f}`\n"
+            f"**Exit Price:** `${float(trade['close_price']):.2f}`\n"
+            f"**Net PnL:** **`{pnl_sign}${pnl:.2f} Gold Points ($)`**"
+        ),
+        color=color,
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.set_footer(text="CapeTrader Paper Trading & Auto-Journaling System • Status: CLOSED")
+    return embed
+
+
+def build_trade_resolved_embed(trade: Dict[str, Any]) -> discord.Embed:
+    """Builds a Discord Embed when a paper trade is automatically hit (WON/LOST) by the 15m loop."""
+    status = trade.get("status", "CLOSED").upper()
+    is_won = status == "WON"
+    color = discord.Color.gold() if is_won else discord.Color.red()
+    title = f"🎉 TAKE-PROFIT HIT! • Paper Trade #{trade['id']}" if is_won else f"🛑 STOP-LOSS HIT • Paper Trade #{trade['id']}"
+    pnl = trade.get("pnl_dollars", 0.0) or 0.0
+    pnl_sign = "+" if pnl >= 0 else ""
+    reason = trade.get("resolution_reason", "Price reached target level")
+
+    embed = discord.Embed(
+        title=title,
+        description=(
+            f"**Strategy #{trade['strategy_id']}:** `{trade['strategy_name']}`\n"
+            f"**Direction:** `{trade['direction']}`\n"
+            f"**Entry Price:** `${float(trade['entry_price']):.2f}`\n"
+            f"**Exit Price:** `${float(trade['close_price']):.2f}`\n"
+            f"**Result:** `{'🏆 WON (+TP Hit)' if is_won else '❌ LOST (-SL Hit)'}`\n"
+            f"**Points / PnL:** **`{pnl_sign}${pnl:.2f} Gold Points ($)`**\n"
+            f"**Trigger:** `{reason}`"
+        ),
+        color=color,
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.set_footer(text="CapeTrader Automated Hit/Miss Detector (15m Candle Loop)")
+    return embed
+
+
+def build_journal_stats_embed(stats: Dict[str, Any], open_trades: List[Dict[str, Any]]) -> discord.Embed:
+    """Builds a comprehensive Discord Embed showing strategy win rates and journal statistics."""
+    closed = stats["closed_trades"]
+    won = stats["won_trades"]
+    lost = stats["lost_trades"]
+    win_rate = stats["win_rate"]
+    total_pnl = stats["total_pnl"]
+    pnl_sign = "+" if total_pnl >= 0 else ""
+
+    embed = discord.Embed(
+        title="📊 Institutional Strategy Performance Journal",
+        description=(
+            f"**Overall Win Rate:** **`{win_rate:.1f}%`** ({won} Wins / {lost} Losses)\n"
+            f"**Total Tracked Trades:** `{stats['total_trades']}` (`{closed} Closed` • `{stats['open_trades']} Open`)\n"
+            f"**Cumulative Closed PnL:** **`{pnl_sign}${total_pnl:.2f} Gold Points ($)`**\n\n"
+            f"**{stats['top_strategy']}**"
+        ),
+        color=discord.Color.gold(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+
+    b = stats["breakdown"]
+    s1 = b[1]
+    s2 = b[2]
+    s3 = b[3]
+
+    embed.add_field(
+        name="⚡ 1. Asian Judas Swing",
+        value=(
+            f"• **Win Rate:** `{s1['win_rate']:.1f}%`\n"
+            f"• **Record:** `{s1['won']}W / {s1['lost']}L` ({s1['closed']} closed)\n"
+            f"• **Active Open:** `{s1['open']}`\n"
+            f"• **Net PnL:** `{'+' if s1['pnl'] >= 0 else ''}${s1['pnl']:.2f} pts`"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🏰 2. Breakout & Retest",
+        value=(
+            f"• **Win Rate:** `{s2['win_rate']:.1f}%`\n"
+            f"• **Record:** `{s2['won']}W / {s2['lost']}L` ({s2['closed']} closed)\n"
+            f"• **Active Open:** `{s2['open']}`\n"
+            f"• **Net PnL:** `{'+' if s2['pnl'] >= 0 else ''}${s2['pnl']:.2f} pts`"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🌊 3. Trend Scalper",
+        value=(
+            f"• **Win Rate:** `{s3['win_rate']:.1f}%`\n"
+            f"• **Record:** `{s3['won']}W / {s3['lost']}L` ({s3['closed']} closed)\n"
+            f"• **Active Open:** `{s3['open']}`\n"
+            f"• **Net PnL:** `{'+' if s3['pnl'] >= 0 else ''}${s3['pnl']:.2f} pts`"
+        ),
+        inline=True,
+    )
+
+    if open_trades:
+        open_desc = []
+        for t in open_trades[:5]:
+            open_desc.append(
+                f"• **#{t['id']}**: {t['direction']} Strat {t['strategy_id']} @ `${t['entry_price']:.2f}` "
+                f"(SL: `${t['stop_loss']:.2f}`, TP: `${t['take_profit']:.2f}`)"
+            )
+        if len(open_trades) > 5:
+            open_desc.append(f"...and {len(open_trades) - 5} more")
+        embed.add_field(
+            name=f"🟢 Active Open Paper Trades ({len(open_trades)})",
+            value="\n".join(open_desc),
+            inline=False,
+        )
+
+    embed.set_footer(text="Antigravity Quantitative Trading Bot • Paper Trading & Auto-Journal")
+    return embed
+
+
 # --------------------------------------------------------------------------------------
 # SYNCHRONOUS MARKET DATA PIPELINES
 # --------------------------------------------------------------------------------------
@@ -2431,6 +2900,8 @@ def run_levels_pipeline() -> Dict[str, Any]:
     df_h1 = engine.calculate_indicators(df_h1)
     levels = engine.calculate_institutional_levels(df_m15, df_d1)
     current_price = float(df_m5["close"].iloc[-1])
+    current_high = float(df_m5["high"].iloc[-1])
+    current_low = float(df_m5["low"].iloc[-1])
 
     m5_latest = {
         "close": round(float(df_m5["close"].iloc[-1]), 2),
@@ -2465,6 +2936,8 @@ def run_levels_pipeline() -> Dict[str, Any]:
         "m15": m15_latest,
         "h1": h1_latest,
         "current_price": current_price,
+        "current_high": current_high,
+        "current_low": current_low,
         "source_name": source_name,
         "macro": macro_data,
         "df_m5": df_m5,
@@ -2500,6 +2973,8 @@ def run_analysis_pipeline() -> Dict[str, Any]:
     levels = engine.calculate_institutional_levels(df_m15, df_d1)
 
     current_price = float(df_m5["close"].iloc[-1])
+    current_high = float(df_m5["high"].iloc[-1])
+    current_low = float(df_m5["low"].iloc[-1])
 
     # 3. Candlestick Pattern Detection (M5, M15, H1)
     patterns_m5 = engine.detect_candlestick_patterns(
@@ -2609,6 +3084,8 @@ def run_analysis_pipeline() -> Dict[str, Any]:
         "payload": payload,
         "levels": levels,
         "current_price": current_price,
+        "current_high": current_high,
+        "current_low": current_low,
         "source_name": source_name,
         "probability": parsed["probability"],
         "bias": parsed["bias"],
@@ -2921,6 +3398,203 @@ if HAS_DISCORD:
             await interaction.followup.send(f"❌ **Error running strategy scan:** `{exc}`", ephemeral=True)
 
     # ----------------------------------------------------------------------------------
+    # SLASH COMMAND: /track (Institutional Paper Trading & Auto-Journaling)
+    # ----------------------------------------------------------------------------------
+    @bot.tree.command(
+        name="track",
+        description="Paper trade & auto-journal the 3 institutional strategies (track win/loss rates & stats)"
+    )
+    @app_commands.describe(
+        action="Action: 'open' new paper trade, 'close' existing trade, or 'stats' journal overview",
+        strategy="Institutional Strategy: 1 (Judas Sweep), 2 (Breakout & Retest), 3 (Trend Scalper)",
+        direction="Trade direction: BUY (Long) or SELL (Short)",
+        stop_loss="Custom Stop-Loss Gold price (leave blank for auto 1.5x ATR stop)",
+        take_profit="Custom Take-Profit Gold price (leave blank for auto 1:2 RRR target)",
+        trade_id="Trade ID to close (used when action is 'close')",
+        result="Close result: WIN or LOSS (used when action is 'close')",
+    )
+    @app_commands.choices(
+        action=[
+            app_commands.Choice(name="Open New Paper Trade", value="open"),
+            app_commands.Choice(name="Close Existing Trade", value="close"),
+            app_commands.Choice(name="View Strategy Win Rate & Journal Stats", value="stats"),
+        ],
+        strategy=[
+            app_commands.Choice(name="1. Asian Session Sweep (Judas Swing)", value="1"),
+            app_commands.Choice(name="2. London/NY Breakout & Retest", value="2"),
+            app_commands.Choice(name="3. EMA 20/50 + VWAP Trend Pullback", value="3"),
+        ],
+        direction=[
+            app_commands.Choice(name="BUY (Long)", value="BUY"),
+            app_commands.Choice(name="SELL (Short)", value="SELL"),
+        ],
+        result=[
+            app_commands.Choice(name="WIN (Take-Profit Reached)", value="WIN"),
+            app_commands.Choice(name="LOSS (Stop-Loss Reached)", value="LOSS"),
+        ],
+    )
+    async def track_command(
+        interaction: discord.Interaction,
+        action: app_commands.Choice[str],
+        strategy: Optional[app_commands.Choice[str]] = None,
+        direction: Optional[app_commands.Choice[str]] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        trade_id: Optional[int] = None,
+        result: Optional[app_commands.Choice[str]] = None,
+    ):
+        await interaction.response.defer(thinking=True)
+        try:
+            action_val = action.value.lower()
+
+            # ACTION: stats
+            if action_val == "stats":
+                stats = await asyncio.to_thread(TradeJournal.get_stats)
+                open_trades = await asyncio.to_thread(TradeJournal.get_open_trades)
+                embed = build_journal_stats_embed(stats, open_trades)
+                await interaction.followup.send(embed=embed)
+                return
+
+            # ACTION: close
+            if action_val == "close":
+                if trade_id is None:
+                    open_trades = await asyncio.to_thread(TradeJournal.get_open_trades)
+                    if not open_trades:
+                        await interaction.followup.send(
+                            "ℹ️ **No active paper trades found.** Use `/track action:Open` to log a new paper trade.",
+                            ephemeral=True,
+                        )
+                        return
+                    lines = ["**Active Open Trades:**"]
+                    for t in open_trades[:10]:
+                        lines.append(
+                            f"• **Trade #{t['id']}:** {t['direction']} Strat {t['strategy_id']} @ `${t['entry_price']:.2f}` "
+                            f"(SL: `${t['stop_loss']:.2f}`, TP: `${t['take_profit']:.2f}`)"
+                        )
+                    lines.append("\n👉 Run `/track action:Close trade_id:<ID> result:<WIN/LOSS>` to close one.")
+                    await interaction.followup.send("\n".join(lines), ephemeral=True)
+                    return
+
+                trade = await asyncio.to_thread(TradeJournal.get_trade, trade_id)
+                if not trade:
+                    await interaction.followup.send(f"❌ **Trade #{trade_id} not found in journal.**", ephemeral=True)
+                    return
+                if trade["status"] != "OPEN":
+                    await interaction.followup.send(
+                        f"ℹ️ **Trade #{trade_id} is already closed as {trade['status']}.**", ephemeral=True
+                    )
+                    return
+
+                levels_data = await asyncio.to_thread(run_levels_pipeline)
+                current_price = levels_data["current_price"]
+
+                res_str = result.value if result else None
+                if not res_str:
+                    if trade["direction"] == "BUY":
+                        res_str = "WIN" if current_price >= trade["entry_price"] else "LOSS"
+                    else:
+                        res_str = "WIN" if current_price <= trade["entry_price"] else "LOSS"
+
+                closed_trade = await asyncio.to_thread(
+                    TradeJournal.close_trade,
+                    trade_id=trade_id,
+                    result=res_str,
+                    close_price=current_price,
+                    notes=f"Manually closed via Discord command at ${current_price:.2f}",
+                )
+                embed = build_trade_close_embed(closed_trade)
+                await interaction.followup.send(embed=embed)
+                return
+
+            # ACTION: open
+            if action_val == "open":
+                strat_id = int(strategy.value) if strategy else 1
+                levels_data = await asyncio.to_thread(run_levels_pipeline)
+                current_price = levels_data["current_price"]
+                atr_m5 = levels_data["m5"]["atr_14"]
+                levels = levels_data["levels"]
+
+                scanned = await asyncio.to_thread(
+                    StrategyScanner.scan_all,
+                    df_m5=levels_data["df_m5"],
+                    df_m15=levels_data["df_m15"],
+                    df_h1=levels_data["df_h1"],
+                    levels=levels,
+                    m5_metrics=levels_data["m5"],
+                    m15_metrics=levels_data["m15"],
+                    h1_metrics=levels_data["h1"],
+                    patterns_m5=[],
+                    patterns_m15=[],
+                    current_price=current_price,
+                )
+                strat_keys = {1: "judas_swing", 2: "breakout_retest", 3: "trend_pullback"}
+                strat_info = scanned.get(strat_keys.get(strat_id, "judas_swing"), {})
+
+                # Determine direction
+                dir_val = direction.value if direction else None
+                if not dir_val:
+                    if "BULLISH" in strat_info.get("direction", ""):
+                        dir_val = "BUY"
+                    elif "BEARISH" in strat_info.get("direction", ""):
+                        dir_val = "SELL"
+                    else:
+                        dir_val = "BUY"
+
+                # Determine Stop-Loss
+                sl_val = stop_loss
+                if sl_val is None:
+                    if strat_info.get("sl"):
+                        sl_val = float(strat_info["sl"])
+                    elif dir_val == "BUY":
+                        sl_val = round(current_price - max(1.5, 1.5 * atr_m5), 2)
+                    else:
+                        sl_val = round(current_price + max(1.5, 1.5 * atr_m5), 2)
+
+                # Determine Take-Profit
+                tp_val = take_profit
+                if tp_val is None:
+                    if strat_info.get("tp1"):
+                        tp_val = float(strat_info["tp1"])
+                    else:
+                        risk_dist = abs(current_price - sl_val)
+                        if dir_val == "BUY":
+                            tp_val = round(current_price + 2.0 * risk_dist, 2)
+                        else:
+                            tp_val = round(current_price - 2.0 * risk_dist, 2)
+
+                # Parameter validation
+                if dir_val == "BUY" and sl_val >= current_price:
+                    await interaction.followup.send(
+                        f"❌ **Invalid Stop-Loss:** For BUY trades, Stop-Loss (${sl_val:.2f}) must be BELOW entry price (${current_price:.2f}).",
+                        ephemeral=True,
+                    )
+                    return
+                if dir_val == "SELL" and sl_val <= current_price:
+                    await interaction.followup.send(
+                        f"❌ **Invalid Stop-Loss:** For SELL trades, Stop-Loss (${sl_val:.2f}) must be ABOVE entry price (${current_price:.2f}).",
+                        ephemeral=True,
+                    )
+                    return
+
+                new_trade = await asyncio.to_thread(
+                    TradeJournal.open_trade,
+                    strategy_id=strat_id,
+                    direction=dir_val,
+                    entry_price=current_price,
+                    stop_loss=sl_val,
+                    take_profit=tp_val,
+                    strategy_name=TradeJournal.STRATEGY_NAMES.get(strat_id, f"Strategy {strat_id}"),
+                    notes="Opened via /track slash command",
+                )
+                embed = build_trade_open_embed(new_trade)
+                await interaction.followup.send(embed=embed)
+                return
+
+        except Exception as exc:
+            logger.error("Error executing /track slash command: %s", exc, exc_info=True)
+            await interaction.followup.send(f"❌ **Error executing /track:** `{exc}`", ephemeral=True)
+
+    # ----------------------------------------------------------------------------------
     # BACKGROUND TASK: 15-MINUTE CANDLE CLOSE SYNCHRONIZED LOOP
     # ----------------------------------------------------------------------------------
     @tasks.loop(minutes=15)
@@ -2928,11 +3602,35 @@ if HAS_DISCORD:
         logger.info("[DISCORD BOT] Executing scheduled 15-minute intraday forecast scan...")
         try:
             analysis = await asyncio.to_thread(run_analysis_pipeline)
+            current_price = analysis["current_price"]
             embed = analysis.get("embed") or build_forecast_embed(analysis)
             prob = analysis.get("probability", 5.0)
             bias = analysis.get("bias", "")
             is_red = analysis["payload"]["economic_calendar"].get("red_folder_alert", False)
             has_active_strat = any("ACTIVE" in s.get("status", "") for s in analysis.get("strategies", {}).values())
+
+            # 0. Check paper trading journal open positions against live candle range
+            try:
+                high_p = analysis.get("current_high", current_price)
+                low_p = analysis.get("current_low", current_price)
+                resolved_trades = await asyncio.to_thread(
+                    TradeJournal.check_open_trades_against_price,
+                    current_price=current_price,
+                    high_price=high_p,
+                    low_price=low_p,
+                )
+                if resolved_trades and DISCORD_ALERT_CHANNEL_ID:
+                    ch_id = int(DISCORD_ALERT_CHANNEL_ID)
+                    channel = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
+                    if channel:
+                        for r_trade in resolved_trades:
+                            res_embed = build_trade_resolved_embed(r_trade)
+                            mention = get_alert_mention()
+                            content = f"{mention} 🎯 **Paper Trade Hit Detected!**" if mention else None
+                            await channel.send(content=content, embed=res_embed)
+                            logger.info("[TRADE JOURNAL] Auto-resolved trade #%d as %s", r_trade["id"], r_trade["status"])
+            except Exception as j_exc:
+                logger.warning("[TRADE JOURNAL] Resolution check encountered an issue: %s", j_exc)
 
             # Attach live M5 chart to scheduled embed
             chart_file = discord.File(io.BytesIO(analysis["chart_bytes"]), filename="gold_chart.png")
@@ -3030,7 +3728,7 @@ if HAS_FLASK:
     @keep_alive_app.route("/")
     def keep_alive_index():
         """Root route pinged by UptimeRobot, Render, or Replit to prevent sleep."""
-        return "Bot is alive!", 200
+        return "CapeTrader XAU/USD Intelligence Bot is Alive & Running 24/7 🚀", 200
 
     @keep_alive_app.route("/health")
     def keep_alive_health():
@@ -3084,6 +3782,9 @@ def main():
         logger.info("Flag --once was specified. Running single diagnostic market scan...")
         analysis = run_analysis_pipeline()
         DispatchEngine.broadcast(analysis["forecast_text"])
+        stats = TradeJournal.get_stats()
+        logger.info("[TRADE JOURNAL] Current Journal Stats: %d total trades (%d won, %d lost, %d open) | Win Rate: %.1f%%",
+                    stats["total_trades"], stats["won_trades"], stats["lost_trades"], stats["open_trades"], stats["win_rate"])
         logger.info("Diagnostic scan complete. Exiting cleanly.")
         sys.exit(0)
 
@@ -3092,7 +3793,7 @@ def main():
 
     # 2. Interactive Discord Bot Mode (if DISCORD_BOT_TOKEN is set)
     if DISCORD_BOT_TOKEN and HAS_DISCORD:
-        logger.info("Starting interactive Discord Bot with Slash Commands (/predict, /levels, /news, /chart, /calc, /strategies)...")
+        logger.info("Starting interactive Discord Bot with Slash Commands (/predict, /levels, /news, /chart, /calc, /strategies, /track)...")
         try:
             bot.run(DISCORD_BOT_TOKEN)
         except Exception as exc:
